@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Parquet Studio</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📊</text></svg>" />
+</head>
+<body>
+
+<!-- ───────────────────────────── top bar ───────────────────────────── -->
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span class="brand-name">Parquet&nbsp;Studio</span>
+  </div>
+
+  <div class="file-meta" id="file-meta" hidden>
+    <span class="file-name" id="file-name"></span>
+    <span class="file-facts" id="file-facts"></span>
+  </div>
+
+  <div class="topbar-actions">
+    <button class="btn ghost" id="btn-theme" title="Toggle light / dark"></button>
+    <button class="btn ghost" id="btn-change-file" hidden>Open another file</button>
+    <button class="btn primary" id="btn-export" hidden>Export</button>
+  </div>
+</header>
+
+<!-- ───────────────────────────── welcome ───────────────────────────── -->
+<section class="welcome" id="welcome">
+  <div class="welcome-card" id="drop-zone">
+    <h1>Read, filter and export parquet</h1>
+    <p class="lede">
+      Built for files with millions of rows. Nothing is loaded into memory —
+      DuckDB reads only the rows your filters actually touch.
+    </p>
+
+    <div class="open-row">
+      <input type="text" id="path-input" class="input mono" spellcheck="false"
+             placeholder="/absolute/path/to/file.parquet   (or a folder of parquet parts)" />
+      <button class="btn primary" id="btn-open-path">Open</button>
+      <button class="btn" id="btn-browse">Browse…</button>
+    </div>
+
+    <div class="or-line"><span>or drop a .parquet file here</span></div>
+    <p class="hint">
+      Dropped files are copied to a temp folder first. For very large files, paste the
+      path above instead — it reads the file in place.
+    </p>
+
+    <div class="recents" id="recents" hidden>
+      <h2>Recent</h2>
+      <ul id="recents-list"></ul>
+    </div>
+
+    <div class="open-error" id="open-error" hidden></div>
+  </div>
+</section>
+
+<!-- ───────────────────────────── workspace ───────────────────────────── -->
+<main class="workspace" id="workspace" hidden>
+
+  <!-- columns rail -->
+  <aside class="rail" id="rail">
+    <div class="rail-head">
+      <div class="rail-title">
+        <span>Columns</span>
+        <span class="pill" id="column-count"></span>
+      </div>
+      <input type="search" id="column-search" class="input small" placeholder="Find a column…" />
+      <div class="rail-tools">
+        <button class="link-btn" id="btn-show-all">Show all</button>
+        <span class="dot-sep">·</span>
+        <button class="link-btn" id="btn-hide-all">Hide all</button>
+      </div>
+    </div>
+    <ul class="column-list" id="column-list"></ul>
+  </aside>
+
+  <!-- main panel -->
+  <section class="panel">
+    <nav class="view-switch">
+      <button class="view-tab active" id="tab-data">Data</button>
+      <button class="view-tab" id="tab-pivot">Pivot</button>
+      <button class="view-tab" id="tab-diff">Difference</button>
+      <span class="view-hint" id="view-hint">Filters below apply to both views.</span>
+    </nav>
+
+    <div class="filter-bar" id="filter-bar">
+      <div class="chips" id="chips"></div>
+      <button class="link-btn danger" id="btn-clear-filters" hidden>Clear all filters</button>
+    </div>
+
+    <div class="view" id="data-view">
+    <div class="table-toolbar">
+      <div class="match-readout" id="match-readout"></div>
+      <div class="toolbar-right">
+        <label class="field inline">
+          <span>Rows</span>
+          <select id="page-size" class="input small">
+            <option value="10" selected>10</option>
+            <option value="25">25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+            <option value="250">250</option>
+          </select>
+        </label>
+        <div class="pager">
+          <button class="btn icon" id="btn-prev" title="Previous rows">‹</button>
+          <span class="page-label" id="page-label">1</span>
+          <button class="btn icon" id="btn-next" title="Next rows">›</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="table-wrap" id="table-wrap">
+      <table class="grid" id="grid">
+        <thead id="grid-head"></thead>
+        <tbody id="grid-body"></tbody>
+      </table>
+      <div class="table-overlay" id="table-overlay" hidden>
+        <div class="spinner"></div>
+      </div>
+    </div>
+
+    <footer class="statusbar">
+      <span id="status-left"></span>
+      <span id="status-right"></span>
+    </footer>
+    </div><!-- /data-view -->
+
+    <!-- ─────────────────────── pivot view ─────────────────────── -->
+    <div class="view" id="pivot-view" hidden>
+      <div class="pivot-builder" id="pivot-builder">
+        <div class="well" id="well-rows" data-well="rows">
+          <div class="well-head">
+            <span class="well-title">Rows</span>
+            <button class="link-btn" data-add="rows">+ Add</button>
+          </div>
+          <div class="well-drop" id="drop-rows"></div>
+        </div>
+        <div class="well" id="well-columns" data-well="columns">
+          <div class="well-head">
+            <span class="well-title">Columns</span>
+            <button class="link-btn" data-add="columns">+ Add</button>
+          </div>
+          <div class="well-drop" id="drop-columns"></div>
+        </div>
+        <div class="well wide" id="well-values" data-well="values">
+          <div class="well-head">
+            <span class="well-title">Values</span>
+            <button class="link-btn" data-add="values">+ Add</button>
+          </div>
+          <div class="well-drop" id="drop-values"></div>
+        </div>
+      </div>
+
+      <div class="pivot-toolbar">
+        <div class="match-readout" id="pivot-readout"></div>
+        <div class="toolbar-right">
+          <label class="check tight"><input type="checkbox" id="opt-subtotals" checked /><span>Subtotals</span></label>
+          <label class="check tight"><input type="checkbox" id="opt-row-totals" checked /><span>Total column</span></label>
+          <label class="check tight"><input type="checkbox" id="opt-grand" checked /><span>Grand total</span></label>
+          <label class="check tight" title="Print the outer row labels on every row instead of only the first of each group"><input type="checkbox" id="opt-repeat-labels" /><span>Repeat labels</span></label>
+          <button class="btn" id="btn-pivot-swap" title="Swap the Rows and Columns fields">⇄ Swap</button>
+          <button class="btn" id="btn-pivot-clear">Clear</button>
+          <button class="btn primary" id="btn-pivot-export">Export to Excel</button>
+        </div>
+      </div>
+
+      <div class="table-wrap" id="pivot-wrap">
+        <table class="grid pivot-grid" id="pivot-grid">
+          <thead id="pivot-head"></thead>
+          <tbody id="pivot-body"></tbody>
+        </table>
+        <div class="pivot-empty" id="pivot-empty">
+          <div class="empty-title">Build a pivot</div>
+          <div class="empty-sub">
+            Drag columns from the left rail into <b>Rows</b>, <b>Columns</b> and <b>Values</b> —
+            or use <b>+ Add</b> on any of the three. Every filter you have set still applies.
+          </div>
+        </div>
+        <div class="table-overlay" id="pivot-overlay" hidden><div class="spinner"></div></div>
+      </div>
+
+      <footer class="statusbar">
+        <span id="pivot-status-left"></span>
+        <span id="pivot-status-right"></span>
+      </footer>
+    </div><!-- /pivot-view -->
+
+    <!-- ─────────────────── difference analysis view ─────────────────── -->
+    <div class="view" id="diff-view" hidden>
+      <div class="diff-config" id="diff-config">
+        <div class="diff-config-row">
+          <label class="field inline wide">
+            <span>Group by <em>(the key that defines one thing)</em></span>
+            <select id="diff-key" class="input small"></select>
+          </label>
+          <label class="field inline wide">
+            <span>Explained by <em>(what differences are expected to follow)</em></span>
+            <select id="diff-explain" class="input small"></select>
+          </label>
+          <label class="field inline">
+            <span>Sample</span>
+            <select id="diff-sample" class="input small">
+              <option value="">Every asset — the real answer</option>
+              <option value="10000" selected>10,000 assets — fast preview</option>
+              <option value="1000">1,000 assets — very fast</option>
+            </select>
+          </label>
+        </div>
+        <div class="diff-config-row">
+          <div class="field inline grow">
+            <span>Exclude from the analysis <em id="diff-exclude-count"></em></span>
+            <div class="exclude-box" id="diff-exclude"></div>
+          </div>
+          <div class="diff-config-side">
+            <label class="check tight">
+              <input type="checkbox" id="diff-skip-blank" checked />
+              <span>Set aside columns that are blank in every row</span>
+            </label>
+            <label class="check tight">
+              <input type="checkbox" id="diff-use-filters" />
+              <span>Only analyse the rows my filters match</span>
+            </label>
+            <div class="diff-actions">
+              <button class="btn primary" id="btn-diff-run">Run analysis</button>
+              <button class="btn" id="btn-diff-cancel" hidden>Cancel</button>
+              <button class="btn" id="btn-diff-export" disabled>Export</button>
+            </div>
+          </div>
+        </div>
+        <div class="notice" id="diff-warning">
+          This reads the whole file once per column, so it takes minutes on a large
+          extract. It never runs on its own — press <b>Run analysis</b> when the
+          settings above are right.
+        </div>
+      </div>
+
+      <div class="diff-progress" id="diff-progress" hidden>
+        <div class="progress-head">
+          <span id="diff-progress-label"></span>
+          <span class="mono" id="diff-progress-detail"></span>
+        </div>
+        <div class="progress-track"><div class="progress-fill" id="diff-progress-fill"></div></div>
+      </div>
+
+      <div class="diff-findings" id="diff-findings" hidden></div>
+
+      <div class="diff-toolbar" id="diff-toolbar" hidden>
+        <div class="chips" id="diff-filter-chips"></div>
+        <div class="toolbar-right">
+          <input type="search" id="diff-search" class="input small" placeholder="Find a column…" />
+        </div>
+      </div>
+
+      <div class="diff-split">
+        <div class="table-wrap" id="diff-wrap">
+          <table class="grid diff-grid" id="diff-grid">
+            <thead id="diff-head"></thead>
+            <tbody id="diff-body"></tbody>
+          </table>
+          <div class="pivot-empty" id="diff-empty">
+            <div class="empty-title">Which columns actually differ?</div>
+            <div class="empty-sub">
+              Pick the column that identifies one thing — an asset ID — and the column
+              that ought to explain any variation, then <b>Run analysis</b>. Every other
+              column is checked, one at a time, for whether the rows sharing a key agree.
+            </div>
+          </div>
+        </div>
+
+        <aside class="diff-detail" id="diff-detail" hidden>
+          <header class="diff-detail-head">
+            <div>
+              <div class="diff-detail-title" id="diff-detail-title"></div>
+              <div class="diff-detail-sub" id="diff-detail-sub"></div>
+            </div>
+            <button class="btn icon ghost" id="diff-detail-close" title="Close">×</button>
+          </header>
+          <div class="diff-detail-tools">
+            <input type="search" id="diff-asset-jump" class="input small"
+                   placeholder="Jump to an asset ID…" />
+            <div class="pager">
+              <button class="btn icon" id="diff-ex-prev" title="Previous examples">‹</button>
+              <span class="page-label" id="diff-ex-page">1</span>
+              <button class="btn icon" id="diff-ex-next" title="More examples">›</button>
+            </div>
+          </div>
+          <div class="diff-detail-body" id="diff-detail-body"></div>
+        </aside>
+      </div>
+
+      <footer class="statusbar">
+        <span id="diff-status-left"></span>
+        <span id="diff-status-right"></span>
+      </footer>
+    </div><!-- /diff-view -->
+  </section>
+</main>
+
+<!-- ───────────────────────────── floating menu ───────────────────────────── -->
+<div class="menu" id="menu" hidden></div>
+
+<!-- ───────────────────────────── filter popover ───────────────────────────── -->
+<div class="popover" id="popover" hidden>
+  <header class="pop-head">
+    <div>
+      <div class="pop-title" id="pop-title"></div>
+      <div class="pop-type" id="pop-type"></div>
+    </div>
+    <button class="btn icon ghost" id="pop-close" title="Close">×</button>
+  </header>
+
+  <nav class="tabs" id="pop-tabs"></nav>
+  <div class="pop-body" id="pop-body"></div>
+
+  <footer class="pop-foot">
+    <button class="link-btn danger" id="pop-clear">Clear filter</button>
+    <div class="grow"></div>
+    <button class="btn" id="pop-cancel">Cancel</button>
+    <button class="btn primary" id="pop-apply">Apply</button>
+  </footer>
+</div>
+
+<!-- ───────────────────────────── export drawer ───────────────────────────── -->
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="drawer" hidden>
+  <header class="drawer-head">
+    <h2 id="drawer-title">Export filtered data</h2>
+    <button class="btn icon ghost" id="drawer-close">×</button>
+  </header>
+
+  <div class="drawer-body">
+    <div class="summary-card" id="export-summary"></div>
+
+    <label class="field" id="field-format">
+      <span>Format</span>
+      <select id="export-format" class="input">
+        <option value="xlsx" selected>Excel workbook (.xlsx)</option>
+        <option value="csv">CSV (.csv) — fastest for huge results</option>
+        <option value="parquet">Parquet (.parquet)</option>
+        <option value="json">JSON (.json)</option>
+      </select>
+    </label>
+
+    <div class="excel-only" id="excel-only">
+      <label class="field">
+        <span>Sheet name</span>
+        <input type="text" id="export-sheet" class="input" value="Data" maxlength="28" />
+      </label>
+      <label class="check">
+        <input type="checkbox" id="export-manifest" checked />
+        <span>Add an “Export info” sheet listing the filters applied</span>
+      </label>
+      <div class="notice" id="excel-notice" hidden></div>
+    </div>
+
+    <label class="field" id="field-limit">
+      <span>Row limit <em>(optional)</em></span>
+      <input type="number" id="export-limit" class="input" min="1" placeholder="No limit — export every matching row" />
+    </label>
+
+    <div class="field" id="field-columns">
+      <span>Columns</span>
+      <div class="column-summary" id="export-columns"></div>
+    </div>
+
+    <div class="progress-block" id="progress-block" hidden>
+      <div class="progress-head">
+        <span id="progress-label"></span>
+        <span class="mono" id="progress-detail"></span>
+      </div>
+      <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
+      <div class="progress-actions">
+        <button class="btn" id="btn-cancel-export">Cancel</button>
+        <a class="btn primary" id="btn-download" hidden download>Download file</a>
+      </div>
+    </div>
+  </div>
+
+  <footer class="drawer-foot">
+    <button class="btn primary block" id="btn-start-export">Start export</button>
+  </footer>
+</aside>
+
+<!-- ───────────────────────────── file browser ───────────────────────────── -->
+<div class="scrim" id="browse-scrim" hidden></div>
+<div class="modal" id="browse-modal" hidden>
+  <header class="modal-head">
+    <h2>Choose a parquet file</h2>
+    <button class="btn icon ghost" id="browse-close">×</button>
+  </header>
+  <div class="crumb mono" id="browse-path"></div>
+  <ul class="browse-list" id="browse-list"></ul>
+  <footer class="modal-foot">
+    <span class="hint" id="browse-hint">Folders containing parquet parts can be opened directly.</span>
+    <button class="btn" id="browse-open-dir">Open this folder as a dataset</button>
+  </footer>
+</div>
+
+<div class="toast-stack" id="toasts"></div>
+<input type="file" id="file-picker" accept=".parquet" hidden />
+
+<script src="/static/app.js"></script>
+</body>
+</html>

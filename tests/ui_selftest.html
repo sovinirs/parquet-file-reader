@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="/static/styles.css"></head>
+<body>
+<div id="results" style="display:none">PENDING</div>
+<div id="host"></div>
+<script>
+const log = [];
+const ok = (name, pass, extra = '') => log.push(`${pass ? 'PASS' : 'FAIL'} | ${name} | ${extra}`);
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+async function until(fn, ms = 6000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) { if (fn()) return true; await sleep(60); }
+  return false;
+}
+
+(async () => {
+  try {
+    // Mount the real index.html body, then boot the real app.js against it.
+    const html = await (await fetch('/')).text();
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    document.body.insertAdjacentHTML('beforeend', doc.body.innerHTML);
+    await new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = '/static/app.js'; s.onload = res; s.onerror = rej;
+      document.body.appendChild(s);
+    });
+    ok('app.js boots and wires up', typeof state === 'object' && typeof refresh === 'function');
+
+    // --- open the file ---
+    const path = new URLSearchParams(location.search).get('path');
+    await openPath(path);
+    await until(() => state.dataset);
+    ok('open file', !!state.dataset, state.dataset && `${state.dataset.row_count} rows`);
+    ok('workspace shown', !document.getElementById('workspace').hidden);
+    ok('welcome hidden', document.getElementById('welcome').hidden);
+    ok('columns rail populated',
+       document.querySelectorAll('#column-list .col-item').length === state.dataset.columns.length,
+       `${document.querySelectorAll('#column-list .col-item').length} items`);
+
+    // --- unfiltered preview: 10 sample rows ---
+    await until(() => document.querySelectorAll('#grid-body tr').length > 0);
+    let rows = document.querySelectorAll('#grid-body tr').length;
+    let cols = document.querySelectorAll('#grid-head th').length;
+    ok('10 sample rows render', rows === 10, `${rows} rows`);
+    ok('all columns in header', cols === state.dataset.columns.length + 1, `${cols} th (incl. row-number)`);
+    ok('readout shows total', document.getElementById('match-readout').textContent.includes('3,000,000'),
+       document.getElementById('match-readout').textContent.trim());
+
+    // --- filter popover on a text column ---
+    const regionCol = state.dataset.columns.find(c => c.name === 'region');
+    openFilterPopover(regionCol, document.querySelector('#column-list .col-item'));
+    ok('popover opens', !document.getElementById('popover').hidden);
+    ok('popover titled', document.getElementById('pop-title').textContent === 'region');
+    await until(() => document.querySelectorAll('#pop-body .value-row').length > 0);
+    const vrows = document.querySelectorAll('#pop-body .value-row');
+    ok('distinct values load with counts', vrows.length === 5, `${vrows.length} values`);
+    ok('value counts shown', /[0-9],[0-9]{3}/.test(vrows[0].textContent), vrows[0].textContent.trim());
+
+    // tick two values and apply, like a user would
+    vrows[0].querySelector('input').click();
+    vrows[1].querySelector('input').click();
+    applyFilter();
+    ok('popover closed after apply', document.getElementById('popover').hidden);
+    await until(() => state.matched !== null && state.matched < 3000000, 8000);
+    ok('filter chip rendered', document.querySelectorAll('#chips .chip').length === 1,
+       document.querySelector('#chips .chip') ? document.querySelector('#chips .chip').textContent.trim() : '');
+    ok('matched count updated', state.matched === 1200000, `matched=${state.matched}`);
+    rows = document.querySelectorAll('#grid-body tr').length;
+    ok('filtered sample rows returned', rows === 10, `${rows} rows`);
+
+    // --- second filter: numeric range (multi-column AND) ---
+    const amountCol = state.dataset.columns.find(c => c.name === 'amount');
+    state.filters['amount'] = { column: 'amount', op: 'between', value: 100, value2: 200 };
+    renderChips(); await refresh();
+    await until(() => state.matched !== null && state.matched < 1200000, 8000);
+    ok('two chips for two columns', document.querySelectorAll('#chips .chip').length === 2);
+    ok('multi-column AND narrows further', state.matched > 0 && state.matched < 1200000, `matched=${state.matched}`);
+    const twoColMatched = state.matched;
+
+    // --- third filter: timestamp range across a day boundary ---
+    const createdCol = state.dataset.columns.find(c => c.name === 'created_at');
+    openFilterPopover(createdCol, document.querySelector('#column-list .col-item'));
+    pop.tab = 'range'; renderPopBody();
+    await sleep(300);
+    const dateInputs = document.querySelectorAll('#pop-body input[type=date]');
+    ok('range tab shows two date inputs', dateInputs.length === 2);
+    dateInputs[0].value = '2023-03-01'; dateInputs[1].value = '2023-03-31';
+    dateInputs[0].oninput();
+    applyFilter();
+    ok('timestamp upper bound widened to end of day',
+       state.filters['created_at'].value2 === '2023-03-31 23:59:59.999999',
+       JSON.stringify(state.filters['created_at']));
+    await until(() => state.matched !== null && state.matched < twoColMatched, 8000);
+    ok('three filters ANDed', document.querySelectorAll('#chips .chip').length === 3, `matched=${state.matched}`);
+
+    // --- sorting ---
+    cycleSort('amount');
+    await until(() => state.sort && state.sort.column === 'amount');
+    await sleep(700);
+    ok('sort applied', state.sort.column === 'amount' && state.sort.descending === false);
+
+    // --- hide a column, confirm it leaves preview + export ---
+    state.hidden.add('notes'); renderRail(); await refresh({ countUnchanged: true }); await sleep(500);
+    cols = document.querySelectorAll('#grid-head th').length;
+    ok('hidden column drops out of grid', cols === state.dataset.columns.length, `${cols} th`);
+    ok('visibleColumns excludes it', !visibleColumns().includes('notes'));
+
+    // --- export drawer + a real xlsx export of the filtered set ---
+    openDrawer();
+    ok('export drawer opens', !document.getElementById('drawer').hidden);
+    ok('drawer summary shows row count',
+       document.getElementById('export-summary').textContent.includes(state.matched.toLocaleString()),
+       document.getElementById('export-summary').textContent.replace(/\s+/g, ' ').trim());
+    await startExport();
+    // Each iteration awaits a real fetch, which pauses Chrome's virtual clock —
+    // a timer-based wait would fast-forward past the server's real work.
+    let job = state.exportJob;
+    for (let i = 0; i < 200 && ['queued','counting','running'].includes(job.status); i++) {
+      job = await (await fetch(`/api/export/${job.id}`)).json();
+    }
+    ok('export completes', job.status === 'done',
+       `${job.status} rows=${job.written} bytes=${job.size} sheets=${job.sheets}`);
+    ok('exported row count equals matched', job.written === state.matched,
+       `${job.written} vs ${state.matched}`);
+    const head = await fetch(`/api/export/${job.id}/download`);
+    ok('download endpoint serves the file', head.ok && head.headers.get('content-type').includes('spreadsheetml'),
+       `${head.status} ${head.headers.get('content-type')}`);
+    ok('exported columns exclude the hidden one', !job.filename.includes('notes'), job.filename);
+
+    // --- clearing filters restores the full file ---
+    document.getElementById('btn-clear-filters').click();
+    await until(() => state.matched === 3000000, 8000);
+    ok('clear all filters restores total', state.matched === 3000000, `matched=${state.matched}`);
+    ok('chips cleared', document.querySelectorAll('#chips .chip').length === 0);
+
+    // --- pivot: build one, check the numbers, export it ---
+    document.getElementById('tab-pivot').click();
+    ok('pivot view shown',
+       !document.getElementById('pivot-view').hidden && document.getElementById('data-view').hidden);
+    await loadAggregations();
+    ok('aggregation list loaded from the API', Array.isArray(AGGS) && AGGS.length >= 8,
+       AGGS ? AGGS.map(a => a.id).join(',') : 'none');
+    ok('empty pivot shows the placeholder', !document.getElementById('pivot-empty').hidden);
+
+    addToWell('rows', 'region');
+    addToWell('columns', 'status');
+    addToWell('values', 'amount');
+    ok('a numeric field defaults to Sum', state.pivot.values[0].agg === 'sum');
+    ok('wells render chips', document.querySelectorAll('#pivot-builder .field-chip').length === 3);
+    await until(() => state.pivot.result, 20000);
+
+    let result = state.pivot.result;
+    ok('4 status columns plus a Total', result.leaves.length === 5,
+       result.leaves.map(l => l.label).join(','));
+    ok('5 regions plus a grand total row', result.rows.length === 6, `${result.rows.length} rows`);
+    ok('last row is the grand total', result.rows[5].kind === 'grand', result.rows[5].labels.join('|'));
+    let bodyRows = document.querySelectorAll('#pivot-body tr');
+    ok('grid renders every pivot row', bodyRows.length === 6, `${bodyRows.length} tr`);
+    ok('grand total row is styled as such', bodyRows[5].classList.contains('grand'));
+
+    const rowTotals = result.rows.filter(r => r.kind === 'data').map(r => r.cells[4]);
+    const grandTotal = result.rows[5].cells[4];
+    ok('row totals add up to the grand total',
+       Math.abs(rowTotals.reduce((a, b) => a + b, 0) - grandTotal) < 0.5,
+       `${rowTotals.reduce((a, b) => a + b, 0)} vs ${grandTotal}`);
+    const acrossOneRow = result.rows[0].cells.slice(0, 4).reduce((a, b) => a + b, 0);
+    ok('a row adds up across its columns', Math.abs(acrossOneRow - result.rows[0].cells[4]) < 0.5,
+       `${acrossOneRow} vs ${result.rows[0].cells[4]}`);
+
+    // a second row field brings subtotals with it
+    addToWell('rows', 'product');
+    await until(() => state.pivot.result && state.pivot.result.row_fields.length === 2, 20000);
+    result = state.pivot.result;
+    ok('30 detail rows for 5 regions x 6 products',
+       result.rows.filter(r => r.kind === 'data').length === 30);
+    ok('one subtotal per region', result.rows.filter(r => r.kind === 'subtotal').length === 5);
+    ok('subtotal is labelled like Excel', /Total$/.test(result.rows[6].labels[0]), result.rows[6].labels[0]);
+
+    // a second measure widens every column group
+    addToWell('values', 'id');
+    state.pivot.values[1].agg = 'count';
+    await until(() => state.pivot.result && state.pivot.result.values.length === 2, 20000);
+    result = state.pivot.result;
+    ok('two measures double the leaf columns', result.leaves.length === 10, `${result.leaves.length} leaves`);
+    ok('measure labels appear as a header level', result.header.length === 2, `${result.header.length} levels`);
+    ok('counts come back as whole numbers', Number.isInteger(result.rows[0].cells[1]),
+       String(result.rows[0].cells[1]));
+
+    // turning subtotals off removes exactly those rows
+    document.getElementById('opt-subtotals').checked = false;
+    document.getElementById('opt-subtotals').onchange();
+    await until(() => state.pivot.result && !state.pivot.result.rows.some(r => r.kind === 'subtotal'), 20000);
+    ok('subtotals can be switched off',
+       state.pivot.result.rows.filter(r => r.kind === 'data').length === 30);
+    document.getElementById('opt-subtotals').checked = true;
+    document.getElementById('opt-subtotals').onchange();
+    await until(() => state.pivot.result && state.pivot.result.rows.some(r => r.kind === 'subtotal'), 20000);
+
+    // repeating the labels fills in the outer label column on every detail row
+    const outerCell = (tr) => tr.querySelectorAll('td.rl')[0].textContent;
+    const detailRows = () => [...document.querySelectorAll('#pivot-body tr')]
+      .filter(tr => !tr.classList.contains('subtotal') && !tr.classList.contains('grand'));
+    ok('outer labels are blanked by default', detailRows().some(tr => outerCell(tr) === ''));
+    const beforeRepeat = state.pivot.result;
+    document.getElementById('opt-repeat-labels').checked = true;
+    document.getElementById('opt-repeat-labels').onchange();
+    ok('repeat labels fills every outer label cell',
+       detailRows().every(tr => outerCell(tr) !== ''),
+       detailRows().filter(tr => outerCell(tr) === '').length + ' blank');
+    ok('repeating the labels does not refetch the pivot',
+       state.pivot.result === beforeRepeat && state.pivot.repeatLabels === true);
+    document.getElementById('opt-repeat-labels').checked = false;
+    document.getElementById('opt-repeat-labels').onchange();
+    ok('repeat labels can be switched back off',
+       detailRows().some(tr => outerCell(tr) === ''));
+
+    // swapping the axes moves the fields across
+    document.getElementById('btn-pivot-swap').click();
+    await until(() => state.pivot.result && state.pivot.result.column_fields.length === 2, 20000);
+    ok('swap moves rows to columns and back',
+       state.pivot.rows.join(',') === 'status' && state.pivot.columns.join(',') === 'region,product');
+    document.getElementById('btn-pivot-swap').click();
+    await until(() => state.pivot.result && state.pivot.result.row_fields.length === 2, 20000);
+
+    // sorting by a measure (wait for the *next* result, not the one on screen)
+    const beforeSort = state.pivot.result;
+    setPivotSort(0, true);
+    await until(() => state.pivot.result && state.pivot.result !== beforeSort, 20000);
+    result = state.pivot.result;
+    const firstGroup = result.rows.filter(r => r.kind === 'data').slice(0, 6).map(r => r.cells[8]);
+    ok('largest-first sorts inside each group',
+       firstGroup.every((v, i) => i === 0 || v <= firstGroup[i - 1] + 0.5), firstGroup.join(' '));
+    const beforeUnsort = state.pivot.result;
+    setPivotSort(null);
+    await until(() => state.pivot.result && state.pivot.result !== beforeUnsort, 20000);
+
+    // filters still apply to the pivot
+    state.filters['region'] = { column: 'region', op: 'in', values: ['north'] };
+    renderChips(); await refresh();
+    await until(() => state.pivot.result && state.pivot.result.total_row_groups === 6, 20000);
+    ok('an active filter narrows the pivot', state.pivot.result.total_row_groups === 6,
+       `${state.pivot.result.total_row_groups} row groups`);
+    delete state.filters['region'];
+    renderChips(); await refresh();
+    await until(() => state.pivot.result && state.pivot.result.total_row_groups === 30, 20000);
+
+    // --- export the pivot to Excel ---
+    document.getElementById('btn-pivot-export').click();
+    ok('drawer opens in pivot mode',
+       document.getElementById('drawer-title').textContent.includes('pivot'));
+    ok('format and row-limit fields are hidden for a pivot',
+       document.getElementById('field-format').hidden && document.getElementById('field-limit').hidden);
+    ok('drawer summarises the pivot',
+       document.getElementById('export-summary').textContent.includes('Sum of amount'),
+       document.getElementById('export-summary').textContent.replace(/\s+/g, ' ').trim());
+    await startExport();
+    let pjob = state.exportJob;
+    for (let i = 0; i < 200 && ['queued','counting','running'].includes(pjob.status); i++) {
+      pjob = await (await fetch(`/api/export/${pjob.id}`)).json();
+    }
+    ok('pivot export completes', pjob.status === 'done' && pjob.kind === 'pivot',
+       `${pjob.status} kind=${pjob.kind} rows=${pjob.written} bytes=${pjob.size}`);
+    ok('pivot export writes every row on screen', pjob.written === state.pivot.result.rows.length,
+       `${pjob.written} vs ${state.pivot.result.rows.length}`);
+    const phead = await fetch(`/api/export/${pjob.id}/download`);
+    ok('pivot download is an xlsx',
+       phead.ok && phead.headers.get('content-type').includes('spreadsheetml'),
+       `${phead.status} ${phead.headers.get('content-type')}`);
+    closeDrawer();
+
+    // an impossible aggregation is reported, not thrown
+    state.pivot.values = [{ column: 'notes', agg: 'sum' }];
+    await runPivot();
+    ok('a bad aggregation surfaces as a message',
+       /cannot be applied/.test(state.pivot.error || ''), state.pivot.error || 'no error');
+    ok('the grid clears when the pivot fails',
+       document.querySelectorAll('#pivot-body tr').length === 0);
+
+    document.getElementById('btn-pivot-clear').click();
+    await sleep(200);
+    ok('clearing empties every well',
+       document.querySelectorAll('#pivot-builder .field-chip').length === 0);
+    document.getElementById('tab-data').click();
+    ok('switching back shows the data grid',
+       state.mode === 'data' && !document.getElementById('data-view').hidden);
+
+    // --- EY theme tokens ---
+    // Asserted as computed styles rather than by eye: a stray colour literal
+    // left over from an old palette is exactly the kind of thing that survives
+    // a screenshot review.
+    const YELLOW = 'rgb(255, 235, 10)';
+    const EY_DARK = 'rgb(26, 26, 36)';
+    // The tab was clicked on the line above and its border-colour transitions
+    // over .12s. Headless Chrome's virtual clock does not advance transitions,
+    // so the computed value would stay frozen at the start of the interpolation
+    // however long we wait -- cancelling the transition is what makes it settle.
+    const settled = (el) => {
+      el.style.transition = 'none';
+      void el.offsetHeight;
+      return getComputedStyle(el);
+    };
+    const tab = settled(document.getElementById('tab-data'));
+    ok('the active tab carries the 4px yellow beam',
+       tab.borderBottomWidth === '4px' && tab.borderBottomColor === YELLOW,
+       `${tab.borderBottomWidth} ${tab.borderBottomColor}`);
+    const primary = getComputedStyle(document.getElementById('btn-export'));
+    ok('a primary button is EY yellow with dark ink, never white text',
+       primary.backgroundColor === YELLOW && primary.color === EY_DARK,
+       `${primary.backgroundColor} / ${primary.color}`);
+    ok('corners are squared', primary.borderRadius === '0px', primary.borderRadius);
+    ok('the masthead stays EY dark',
+       getComputedStyle(document.querySelector('.topbar')).backgroundColor === EY_DARK);
+    const mark = getComputedStyle(document.querySelector('.brand-mark'));
+    ok('the brand mark is a yellow beam', mark.backgroundColor === YELLOW && mark.width === '4px',
+       `${mark.backgroundColor} ${mark.width}`);
+
+    applyTheme('light');
+    await sleep(120);
+    ok('the light theme uses EY page grey',
+       getComputedStyle(document.body).backgroundColor === 'rgb(246, 246, 250)',
+       getComputedStyle(document.body).backgroundColor);
+    const link = getComputedStyle(document.querySelector('.link-btn'));
+    // Yellow text on white is unreadable, so links go dark with a yellow rule.
+    ok('links stay readable on white, underlined in yellow',
+       link.color === EY_DARK && link.textDecorationColor === YELLOW,
+       `${link.color} / ${link.textDecorationColor}`);
+    ok('the masthead is dark in the light theme too',
+       getComputedStyle(document.querySelector('.topbar')).backgroundColor === EY_DARK);
+    applyTheme('dark');
+
+
+  } catch (err) {
+    log.push('FAIL | harness threw | ' + (err && err.stack ? err.stack.split('\n')[0] : err));
+  }
+  const el = document.getElementById('results');
+  el.textContent = 'DONE\n' + log.join('\n');
+})();
+
+window.addEventListener('error', (e) => log.push('FAIL | uncaught error | ' + e.message));
+window.addEventListener('unhandledrejection', (e) => log.push('FAIL | unhandled rejection | ' + e.reason));
+</script>
+</body></html>

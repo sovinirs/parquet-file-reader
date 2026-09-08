@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<!--
+  Headless-Chrome walkthrough of the Difference Analysis tab, driven against
+  sample/assets.parquet -- the fixture whose columns each have exactly one
+  defensible verdict. Run by tests/run.sh; the API-level checks that cross-check
+  the classifications against SQL live in tests/test_api.py.
+-->
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="/static/styles.css"></head>
+<body><div id="results" style="display:none">PENDING</div><div id="host"></div>
+<script>
+const log = [];
+const ok = (n, p, extra='') => log.push(`${p?'PASS':'FAIL'} | ${n} | ${extra}`);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function until(fn, ms=30000){const t=Date.now();while(Date.now()-t<ms){if(fn())return true;await sleep(80);}return false;}
+(async () => {
+ try {
+  const html = await (await fetch('/')).text();
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  document.body.insertAdjacentHTML('beforeend', doc.body.innerHTML);
+  await new Promise((res, rej) => { const s=document.createElement('script'); s.src='/static/app.js'; s.onload=res; s.onerror=rej; document.body.appendChild(s); });
+
+  await openPath(new URLSearchParams(location.search).get('path'));
+  await until(() => state.dataset);
+  ok('fixture opens', !!state.dataset, `${state.dataset.row_count} rows`);
+
+  document.getElementById('tab-diff').click();
+  await until(() => !document.getElementById('diff-view').hidden);
+  ok('difference tab shows its panel', state.mode === 'diff');
+  await until(() => document.getElementById('diff-key').options.length > 0);
+  ok('key column guessed from the schema', state.diff.key === 'asset_id', state.diff.key);
+  ok('explanatory column guessed too', state.diff.explain === 'depr_area', state.diff.explain);
+  ok('exclusions list every column but the key',
+     document.querySelectorAll('#diff-exclude label').length === state.dataset.columns.length - 1);
+  ok('nothing runs on arrival', state.diff.results.length === 0 && !state.diff.jobId);
+  ok('the empty state explains the tab', !document.getElementById('diff-empty').hidden);
+
+  // full run, no sampling
+  document.getElementById('diff-sample').value = '';
+  document.getElementById('diff-sample').onchange();
+  document.getElementById('diff-skip-blank').checked = false;
+  document.getElementById('diff-skip-blank').onchange();
+  document.getElementById('btn-diff-run').click();
+  ok('progress bar appears at once', !document.getElementById('diff-progress').hidden);
+  await until(() => state.diff.status && ['done','error','cancelled'].includes(state.diff.status.status));
+  ok('the run completes', state.diff.status.status === 'done', state.diff.status.status);
+  ok('every column got a verdict', state.diff.results.length === state.diff.status.total,
+     `${state.diff.results.length}/${state.diff.status.total}`);
+
+  const rows = document.querySelectorAll('#diff-body tr');
+  ok('a table row per column', rows.length === state.diff.results.length, `${rows.length} tr`);
+  const byCol = Object.fromEntries(state.diff.results.map(r => [r.column, r.verdict]));
+  ok('cost_center reads CONSTANT', byCol.cost_center === 'CONSTANT', byCol.cost_center);
+  ok('last_changed_by reads unexplained', byCol.last_changed_by === 'TRUE_DIFF_OTHER', byCol.last_changed_by);
+  ok('verdict tags are colour-coded',
+     !!document.querySelector('#diff-body .verdict-tag.vt-TRUE_DIFF_OTHER'));
+
+  // findings banner
+  const findings = document.getElementById('diff-findings').textContent;
+  ok('duplicate grain is surfaced above the table', /grain is not one row per/.test(findings),
+     findings.slice(0, 70));
+
+  // chips isolate a verdict
+  const chips = [...document.querySelectorAll('.verdict-chip')];
+  ok('a chip per verdict present, plus All', chips.length >= 4, `${chips.length} chips`);
+  const unexplainedChip = chips.find(c => /Unexplained/.test(c.textContent));
+  unexplainedChip.click();
+  ok('chip isolates the unexplained set',
+     [...document.querySelectorAll('#diff-body tr')].length ===
+     state.diff.results.filter(r => r.verdict === 'TRUE_DIFF_OTHER').length);
+  unexplainedChip.click();
+  ok('clicking it again clears the filter', state.diff.verdictFilter === null);
+
+  // search + sort
+  document.getElementById('diff-search').value = 'serial';
+  document.getElementById('diff-search').oninput();
+  ok('search narrows the table', document.querySelectorAll('#diff-body tr').length === 1);
+  document.getElementById('diff-search').value = '';
+  document.getElementById('diff-search').oninput();
+  const firstHeader = document.querySelector('#diff-head th.sortable');
+  firstHeader.click();
+  ok('headers sort the table', state.diff.sort.by === 'column');
+
+  // drill-down
+  const target = [...document.querySelectorAll('#diff-body tr')]
+    .find(tr => tr.textContent.startsWith('last_changed_by'));
+  target.click();
+  await until(() => state.diff.examples && state.diff.examples.assets.length);
+  ok('drill-down panel opens', !document.getElementById('diff-detail').hidden);
+  ok('it names the column', document.getElementById('diff-detail-title').textContent === 'last_changed_by');
+  const exRows = document.querySelectorAll('#diff-detail-body .example-table tr.differs');
+  ok('differing rows are highlighted', exRows.length > 0, `${exRows.length} highlighted`);
+  ok('one row per depreciation area is shown',
+     document.querySelectorAll('#diff-detail-body .example-asset').length ===
+     state.diff.examples.assets.length);
+
+  // jump to a specific asset
+  document.getElementById('diff-asset-jump').value = 'A-000005';
+  document.getElementById('diff-asset-jump').oninput();
+  await until(() => state.diff.examples && state.diff.examples.assets.length === 1
+                    && state.diff.examples.assets[0].asset === 'A-000005');
+  ok('jumping to an asset ID works',
+     state.diff.examples.assets[0].asset === 'A-000005');
+  document.getElementById('diff-asset-jump').value = '';
+  document.getElementById('diff-asset-jump').oninput();
+  await until(() => state.diff.examples && state.diff.examples.assets.length > 1);
+
+  // paging
+  const firstPage = state.diff.examples.assets[0].asset;
+  document.getElementById('diff-ex-next').click();
+  await until(() => state.diff.examples && state.diff.examples.assets[0].asset !== firstPage);
+  ok('paging fetches the next examples', state.diff.examples.assets[0].asset !== firstPage);
+
+  // export through the shared drawer
+  document.getElementById('btn-diff-export').click();
+  ok('export drawer opens for the analysis', !document.getElementById('drawer').hidden
+     && /difference analysis/i.test(document.getElementById('drawer-title').textContent));
+  ok('drawer summarises the run',
+     /Columns analysed/.test(document.getElementById('export-summary').textContent));
+  ok('only Excel and CSV are offered',
+     [...document.getElementById('export-format').options].filter(o => !o.hidden).length === 2);
+  document.getElementById('btn-start-export').click();
+  await until(() => state.exportJob && ['done','error'].includes(state.exportJob.status), 60000);
+  ok('the analysis exports', state.exportJob.status === 'done',
+     `${state.exportJob.status} ${state.exportJob.filename||''}`);
+  const dl = await fetch(`/api/export/${state.exportJob.id}/download`);
+  ok('the workbook downloads', dl.status === 200, dl.headers.get('content-type'));
+  closeDrawer();
+
+  // sample mode is a separate, faster run
+  document.getElementById('diff-sample').value = '1000';
+  document.getElementById('diff-sample').onchange();
+  ok('the sample select drives the run size', state.diff.sample === 1000, String(state.diff.sample));
+  state.diff.sample = 100;   // smaller than the fixture, so sampling is observable
+  document.getElementById('btn-diff-run').click();
+  await until(() => state.diff.status && state.diff.status.status === 'done');
+  ok('sample mode runs over fewer assets', state.diff.plan.assets === 100, `${state.diff.plan.assets}`);
+  ok('and says so in the findings',
+     /sample mode/i.test(document.getElementById('diff-findings').textContent));
+
+  // The finished progress bar: full width and brand yellow, not the old green.
+  const fill = document.getElementById('diff-progress-fill');
+  ok('a finished run fills its progress bar', fill.style.width === '100%', fill.style.width);
+  ok('and the bar is EY yellow',
+     getComputedStyle(fill).backgroundColor === 'rgb(255, 235, 10)',
+     getComputedStyle(fill).backgroundColor);
+  const tag = document.querySelector('.verdict-tag.vt-TRUE_DIFF_BY_DEPR_AREA');
+  ok('the "differs by area" verdict fills with brand yellow and dark ink',
+     tag && getComputedStyle(tag).backgroundColor === 'rgb(255, 235, 10)'
+         && getComputedStyle(tag).color === 'rgb(26, 26, 36)',
+     tag ? `${getComputedStyle(tag).backgroundColor} / ${getComputedStyle(tag).color}` : 'no tag');
+
+  document.getElementById('tab-data').click();
+  ok('switching away restores the grid', state.mode === 'data'
+     && !document.getElementById('data-view').hidden);
+ } catch (err) { log.push('FAIL | harness threw | ' + (err && err.stack ? err.stack.split('\n').slice(0,2).join(' ') : err)); }
+ document.getElementById('results').textContent = 'DONE\n' + log.join('\n');
+})();
+window.addEventListener('error', e => log.push('FAIL | uncaught error | ' + e.message));
+window.addEventListener('unhandledrejection', e => log.push('FAIL | unhandled rejection | ' + e.reason));
+</script></body></html>

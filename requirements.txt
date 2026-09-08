@@ -1,0 +1,5 @@
+duckdb==1.4.5
+fastapi==0.128.8
+uvicorn[standard]==0.39.0
+XlsxWriter==3.2.9
+python-multipart==0.0.20
