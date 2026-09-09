@@ -49,17 +49,36 @@ VERDICTS = (ALL_BLANK, CONSTANT, SPARSE_SINGLE_VALUE, TRUE_DIFF_BY_DEPR_AREA,
             TRUE_DIFF_OTHER, ERROR)
 
 # What to do with the column when the extract is collapsed to one row per asset.
+# The two attribution verdicts are filled in by `_recommendation()` instead --
+# their wording names whatever column was actually picked as "Explained by",
+# so the text is never wrong just because the dataset isn't a SAP extract.
 RECOMMENDATIONS: Dict[str, str] = {
     ALL_BLANK: "Nothing to keep — the column is blank in every row. Drop it.",
     CONSTANT: "Safe to take any row — every row of an asset already agrees.",
     SPARSE_SINGLE_VALUE: "Coalesce with MAX/ANY_VALUE — the rows complement each "
                          "other, so the one non-blank value survives.",
-    TRUE_DIFF_BY_DEPR_AREA: "Requires a business rule for which depreciation area "
-                            "wins — values differ, but never inside one area.",
-    TRUE_DIFF_OTHER: "Requires a business rule — variation is not explained by "
-                     "depreciation area, so pick the rule after reviewing examples.",
     ERROR: "Could not be analysed — see the error and decide by hand.",
 }
+
+
+def _recommendation(verdict: str, explain_column: Optional[str]) -> str:
+    """What to do with a column, in the reviewer's own words.
+
+    Separate from the static table above because these two verdicts have to
+    name the actual explanatory column someone picked -- "depreciation area"
+    is only right when that is literally what was chosen, and the whole point
+    of letting any column play that role is that it usually isn't.
+    """
+    if verdict == TRUE_DIFF_BY_DEPR_AREA and explain_column:
+        return ("Requires a business rule for which {0} wins — values differ, "
+                "but never inside one {0}.").format(explain_column)
+    if verdict == TRUE_DIFF_OTHER:
+        if explain_column:
+            return ("Requires a business rule — variation is not explained by "
+                    "{}, so pick the rule after reviewing examples.").format(explain_column)
+        return ("Requires a business rule — the rows genuinely disagree, so pick "
+                "the rule after reviewing examples.")
+    return RECOMMENDATIONS.get(verdict, "")
 
 # Columns the business already knows to leave out of a fixed-asset run: run
 # metadata, and the period-dependent amounts that are *expected* to differ per
@@ -133,6 +152,8 @@ class ColumnResult:
     # Only filled in for columns that reached the attribution pass.
     conflicting_assets: Optional[int] = None
     error: Optional[str] = None
+    # Set once the verdict is final -- see `_recommendation()`.
+    recommendation: str = ""
 
     def _pct(self, n: int) -> Optional[float]:
         return round(100.0 * n / self.assets, 2) if self.assets else None
@@ -141,7 +162,7 @@ class ColumnResult:
         return {
             "column": self.column,
             "verdict": self.verdict,
-            "recommendation": RECOMMENDATIONS.get(self.verdict, ""),
+            "recommendation": self.recommendation or RECOMMENDATIONS.get(self.verdict, ""),
             "assets": self.assets,
             "constant": self.constant,
             "sparse": self.sparse,
@@ -174,6 +195,19 @@ class RunPlan:
     assets: int
     rows: int
     sample_table: Optional[str] = None
+    # Whole-record verdict across every checked column at once -- see
+    # `_record_consistency()`. Defaults to "not computed" so a plan built by
+    # older code (or before the candidate list is known) is still a valid dict.
+    record_consistency: Dict[str, Any] = None  # type: ignore[assignment]
+    # The running "still collapses to one row" count as columns are added one
+    # at a time, in the order they were checked -- see `waterfall()`.
+    waterfall_steps: List[Dict[str, Any]] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.record_consistency is None:
+            self.record_consistency = {"checked": False}
+        if self.waterfall_steps is None:
+            self.waterfall_steps = []
 
     def release(self, engine: Engine) -> None:
         if self.sample_table:
@@ -319,6 +353,138 @@ def _duplicate_grain(engine: Engine, dataset: Dataset, config: DiffConfig,
     }
 
 
+def _tuple_expr(columns: Sequence[str]) -> str:
+    """One STRUCT per row, packing every listed column's blank-normalised value.
+
+    The single definition of "a record" this module uses for whole-row
+    comparisons: two rows are the same record exactly when every one of these
+    fields matches. Field names are synthetic (`c0`, `c1`, ...) rather than the
+    real column names, since a file's own column names can contain characters
+    a struct field name cannot.
+    """
+    return "struct_pack({})".format(
+        ", ".join('"c{}" := {}'.format(i, _blank_normalised(name))
+                  for i, name in enumerate(columns)))
+
+
+def record_tuple_counts(engine: Engine, dataset: Dataset, config: DiffConfig,
+                        columns: Sequence[str], keys: Sequence[Any]) -> Dict[str, int]:
+    """Whole-record distinct-tuple count for a specific handful of keys.
+
+    The same question `_record_consistency` asks for the whole run, answered
+    for just the keys already picked as evidence -- so a reviewer looking at
+    one asset's example rows can see how many distinct versions of its *full*
+    record exist, not just how many values the one column being illustrated
+    has. Deliberately scans the whole file rather than joining to any sample
+    table, matching `examples()`: evidence for a specific key is evidence
+    whether or not that key happened to be sampled.
+    """
+    keys = [str(k) for k in keys]
+    if not columns or not keys:
+        return {}
+    scan, params = _scan(engine, dataset, config)
+    key = quote_ident(config.key_column)
+    placeholders = ", ".join("?" for _ in keys)
+    sql = (
+        "SELECT k, count(DISTINCT rec) AS nd FROM (SELECT t.{key} AS k, "
+        "{tuple_expr} AS rec {scan}) GROUP BY 1"
+    ).format(key=key, tuple_expr=_tuple_expr(columns),
+             scan=_and(scan, "CAST(t.{} AS VARCHAR) IN ({})".format(key, placeholders)))
+    rows = engine.cursor().execute(sql, params + keys).fetchall()
+    return {str(k): int(nd) for k, nd in rows}
+
+
+def waterfall(engine: Engine, dataset: Dataset, config: DiffConfig,
+             plan: RunPlan) -> List[Dict[str, Any]]:
+    """How many keys still collapse to one row as columns are added, one at a time.
+
+    `_record_consistency` answers the end state -- all checked columns at once.
+    This answers the more useful question while you're still deciding what to
+    check: which column, specifically, is the one costing you the collapse?
+    Ordered the way a reviewer actually built the list (`config.include`, when
+    it was given) rather than the file's own column order, so "add this
+    column" in the UI and "the next row in this table" mean the same thing.
+
+    It is a genuine funnel, not just another table: each step demands
+    agreement on everything the step before it did, plus one more column, so
+    the clean-key count can only hold steady or shrink as you go down it,
+    never grow. The size of a drop is exactly what that one column cost.
+    """
+    if not plan.columns:
+        return []
+    picked = [c for c in (config.include or []) if c in plan.columns]
+    order = picked if picked else list(plan.columns)
+
+    scan, params = _scan(engine, dataset, config, plan)
+    key = quote_ident(config.key_column)
+    steps: List[Dict[str, Any]] = []
+    previous_clean: Optional[int] = None
+    for i in range(1, len(order) + 1):
+        subset = order[:i]
+        sql = (
+            "SELECT count(*) AS keys_total, "
+            "count(*) FILTER (WHERE nd = 1) AS clean FROM ("
+            "SELECT t.{key} AS k, count(DISTINCT {tuple_expr}) AS nd {scan} GROUP BY 1)"
+        ).format(key=key, tuple_expr=_tuple_expr(subset), scan=scan)
+        keys_total, clean = engine.cursor().execute(sql, params).fetchone()
+        keys_total, clean = int(keys_total), int(clean)
+        steps.append({
+            "column": subset[-1],
+            "columns_so_far": i,
+            "keys_total": keys_total,
+            "keys_clean": clean,
+            "keys_conflicting": keys_total - clean,
+            "clean_pct": round(100.0 * clean / keys_total, 2) if keys_total else None,
+            # None on the first step -- there is no "before" to compare it to.
+            "dropped": None if previous_clean is None else previous_clean - clean,
+        })
+        previous_clean = clean
+    return steps
+
+
+def _record_consistency(engine: Engine, dataset: Dataset, config: DiffConfig,
+                        plan: RunPlan) -> Dict[str, Any]:
+    """Ignore columns one at a time -- do a key's rows agree on *everything*?
+
+    This is the question the per-column verdicts add up to answer piecemeal:
+    pack every checked column's blank-normalised value into one row per key,
+    and count the distinct tuples. One tuple means the whole record already
+    agrees and the key collapses with zero information loss, whatever any
+    individual column's verdict says about it. More than one tuple means a
+    real conflict lives somewhere in the row, even if every column looked
+    fine on its own (e.g. two columns that each vary, but never together).
+
+    Domain-neutral by construction: it is just "how many distinct versions of
+    this record exist," which means the same thing whether the key is an
+    asset, an order, or a customer.
+    """
+    if not plan.columns:
+        return {"checked": False}
+    scan, params = _scan(engine, dataset, config, plan)
+    sql = (
+        "SELECT count(*) AS keys_total, "
+        "count(*) FILTER (WHERE nd = 1) AS clean, "
+        "count(*) FILTER (WHERE nd > 1) AS conflicting, "
+        "coalesce(max(nd), 0) AS max_nd FROM ("
+        "SELECT t.{key} AS k, count(DISTINCT {tuple_expr}) AS nd {scan} GROUP BY 1)"
+    ).format(key=quote_ident(config.key_column), tuple_expr=_tuple_expr(plan.columns), scan=scan)
+    keys_total, clean, conflicting, max_nd = engine.cursor().execute(sql, params).fetchone()
+    keys_total, clean, conflicting = int(keys_total), int(clean), int(conflicting)
+    return {
+        "checked": True,
+        "columns_considered": len(plan.columns),
+        "keys_total": keys_total,
+        "keys_clean": clean,
+        "keys_conflicting": conflicting,
+        "clean_pct": round(100.0 * clean / keys_total, 2) if keys_total else None,
+        "conflicting_pct": round(100.0 * conflicting / keys_total, 2) if keys_total else None,
+        "max_distinct_tuples": int(max_nd),
+        # A run-level verdict of its own, in the same vocabulary as the
+        # per-column ones -- CLEAN when no key needs any decision at all.
+        "verdict": "CLEAN" if conflicting == 0 else "CONFLICTING",
+    }
+
+
 def prepare(engine: Engine, dataset: Dataset, config: DiffConfig) -> RunPlan:
     """Size the run: which columns to analyse, and what is already known.
 
@@ -338,6 +504,15 @@ def prepare(engine: Engine, dataset: Dataset, config: DiffConfig) -> RunPlan:
         name = column.name
         if name == config.key_column:
             excluded.append({"column": name, "reason": "Grouping key"})
+        elif config.explain_column and name == config.explain_column:
+            # Checking the explanatory column against itself is a tautology:
+            # grouped by (key, itself), every subgroup trivially agrees with
+            # itself, so it would always come back "explained" no matter what
+            # the data says. Excluded here rather than left to the caller, so
+            # a stale UI selection or a direct API call can't sneak it in --
+            # this has to hold regardless of whether `include`/`exclude` even
+            # mention it.
+            excluded.append({"column": name, "reason": "Explanatory column"})
         elif picked is not None and name not in picked:
             excluded.append({"column": name, "reason": "Not selected for this run"})
         elif name in requested:
@@ -365,6 +540,8 @@ def prepare(engine: Engine, dataset: Dataset, config: DiffConfig) -> RunPlan:
                 key=quote_ident(config.key_column), scan=scan), params).fetchone()
         plan.rows, plan.assets = int(rows), int(assets)
         plan.duplicate_grain = _duplicate_grain(engine, dataset, config, plan)
+        plan.record_consistency = _record_consistency(engine, dataset, config, plan)
+        plan.waterfall_steps = waterfall(engine, dataset, config, plan)
     except Exception:
         plan.release(engine)
         raise
@@ -403,7 +580,7 @@ def analyse_column(engine: Engine, dataset: Dataset, config: DiffConfig,
     """
     if column in plan.all_blank:
         return ColumnResult(column=column, verdict=ALL_BLANK, assets=plan.assets,
-                            blank=plan.assets)
+                            blank=plan.assets, recommendation=_recommendation(ALL_BLANK, None))
     try:
         scan, params = _scan(engine, dataset, config, plan)
         # Per asset: how many rows, how many non-blank, how many distinct
@@ -445,10 +622,12 @@ def analyse_column(engine: Engine, dataset: Dataset, config: DiffConfig,
             # are wholly blank contradict nothing, so they do not count against
             # a column being constant.
             result.verdict = SPARSE_SINGLE_VALUE
+        result.recommendation = _recommendation(result.verdict, config.explain_column)
         return result
     except Exception as exc:  # noqa: BLE001 - reported against the column
         return ColumnResult(column=column, verdict=ERROR, assets=plan.assets,
-                            error="{}: {}".format(type(exc).__name__, exc))
+                            error="{}: {}".format(type(exc).__name__, exc),
+                            recommendation=_recommendation(ERROR, config.explain_column))
 
 
 def summarise(dataset: Dataset, config: DiffConfig, plan: RunPlan,
@@ -469,6 +648,11 @@ def summarise(dataset: Dataset, config: DiffConfig, plan: RunPlan,
         "excluded": plan.excluded,
         "all_blank_columns": plan.all_blank,
         "duplicate_grain": plan.duplicate_grain,
+        # The headline: do keys collapse cleanly once every checked column is
+        # considered together, not just one at a time? See _record_consistency().
+        "record_consistency": plan.record_consistency,
+        # The same question, one column at a time -- see waterfall().
+        "waterfall": plan.waterfall_steps,
         "verdict_counts": by_verdict,
         "columns": [result.as_dict() for result in results],
     }

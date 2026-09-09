@@ -557,20 +557,32 @@ class ExportManager:
         sheet.set_column(2, 2, 16)
         sheet.set_column(3, 3, 44)
         sheet.set_column(4, 4, 9)
-        sheet.set_column(5, 5, 11)
+        sheet.set_column(5, 5, 13)
+        sheet.set_column(6, 6, 13)
         key_label = (config.as_dict() if hasattr(config, "as_dict")
                      else dict(config or {})).get("key_column") or "Key"
         area_label = (config.as_dict() if hasattr(config, "as_dict")
                       else dict(config or {})).get("explain_column") or "Row"
         for index, title in enumerate(
                 ("Column", key_label, area_label, "Value", "Blank?",
-                 "Distinct values")):
+                 "Distinct values", "Distinct tuples")):
             sheet.write(0, index, title, f["head"])
+        sheet.write_comment(0, 5, "How many distinct values THIS column has for the asset.")
+        sheet.write_comment(0, 6, "How many distinct versions of the WHOLE record exist for "
+                                  "the asset, once every checked column is considered together "
+                                  "-- the same figure as the on-screen and manifest headline, "
+                                  "just broken out per asset.")
 
         differing = [r["column"] for r in (summary.get("columns") or [])
                      if r["verdict"] in (diffanalysis.TRUE_DIFF_OTHER,
                                          diffanalysis.TRUE_DIFF_BY_DEPR_AREA)]
-        line = 1
+        analysed_columns = [r["column"] for r in (summary.get("columns") or [])]
+
+        # Two passes: gather every column's evidence first, so the whole-record
+        # tuple count can be looked up once for the keys actually shown here
+        # rather than re-scanned once per column that happens to mention them.
+        blocks = []
+        seen_keys = set()
         for column in differing[:DIFF_EXPORT_EXAMPLE_COLUMNS]:
             if job._cancel.is_set():
                 raise _Cancelled()
@@ -579,8 +591,17 @@ class ExportManager:
                                               limit=DIFF_EXPORT_EXAMPLE_ASSETS)
             except Exception:  # noqa: BLE001 - one column's evidence, not the file
                 continue
+            blocks.append((column, found))
+            seen_keys.update(str(a["asset"]) for a in found.get("assets") or [])
+
+        tuple_counts = diffanalysis.record_tuple_counts(
+            self.engine, dataset, config, analysed_columns, seen_keys)
+
+        line = 1
+        for column, found in blocks:
             for asset in found.get("assets") or []:
                 distinct = len(asset.get("distinct_values") or [])
+                tuples = tuple_counts.get(str(asset["asset"]))
                 for row in asset["rows"]:
                     sheet.write(line, 0, column, f["cell"])
                     sheet.write(line, 1, str(asset["asset"]), f["cell"])
@@ -591,11 +612,15 @@ class ExportManager:
                                 f["diff_cell"] if asset["differs"] else f["cell"])
                     sheet.write(line, 4, "yes" if row["blank"] else "", f["cell"])
                     sheet.write_number(line, 5, distinct, f["cell"])
+                    if tuples is None:
+                        sheet.write_blank(line, 6, None, f["cell"])
+                    else:
+                        sheet.write_number(line, 6, tuples, f["cell"])
                     line += 1
         if line == 1:
             sheet.write(1, 0, "No column showed a true difference.", f["cell"])
         else:
-            sheet.autofilter(0, 0, line - 1, 5)
+            sheet.autofilter(0, 0, line - 1, 6)
             sheet.freeze_panes(1, 0)
 
     @staticmethod
@@ -636,11 +661,24 @@ class ExportManager:
                     grain.get("column"), grain.get("extra_rows", 0),
                     grain.get("max_rows_per_pair", 0)))
 
+        record = summary.get("record_consistency") or {}
+        if not record.get("checked"):
+            record_text = "Not computed — no column was selected for the run."
+        else:
+            record_text = (
+                "{clean:,} of {total:,} keys ({pct}%) collapse to a single record once "
+                "every one of the {n} checked columns is considered together; "
+                "{bad:,} still hold a genuine conflict somewhere in the row."
+            ).format(clean=record.get("keys_clean", 0), total=record.get("keys_total", 0),
+                     pct=record.get("clean_pct", 0), n=record.get("columns_considered", 0),
+                     bad=record.get("keys_conflicting", 0))
+
         sample = spec.get("sample_assets")
         rows = [
             ("Source file", dataset.path),
             ("Exported at", _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             ("Rows in file", "{:,}".format(dataset.row_count)),
+            ("Record consistency", record_text),
             ("Grouping key", spec.get("key_column")),
             ("Explanatory column", spec.get("explain_column") or "none"),
             ("Sample mode", "{:,} assets sampled — figures are an estimate".format(sample)

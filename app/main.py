@@ -258,6 +258,8 @@ class DiffRunner:
                 "excluded": plan.excluded,
                 "all_blank_columns": plan.all_blank,
                 "duplicate_grain": plan.duplicate_grain,
+                "record_consistency": plan.record_consistency,
+                "waterfall": plan.waterfall_steps,
                 "columns": list(plan.columns),
             }
             results = []

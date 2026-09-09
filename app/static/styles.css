@@ -1253,6 +1253,31 @@ a.btn { display: inline-flex; align-items: center; justify-content: center; }
 
 .diff-progress { padding: 12px 18px; border-bottom: 1px solid var(--border); background: var(--bg-raised); }
 
+/* ── band 1.5: the funnel ─────────────────────────────────────────────────── */
+
+/* One row per checked column, in the order it was added, each one strictly
+   no better than the row above it -- a genuine funnel, not just a table. */
+.diff-waterfall { padding: 13px 18px 15px; border-bottom: 1px solid var(--border); }
+.wf-title { font-size: 13.5px; font-weight: 700; color: var(--text); }
+.wf-sub { font-size: 12px; color: var(--text-dim); margin-top: 2px; margin-bottom: 10px; line-height: 1.5; }
+.wf-list { display: flex; flex-direction: column; gap: 4px; }
+.wf-row {
+  display: grid;
+  grid-template-columns: minmax(90px, 160px) minmax(0, 1fr) minmax(110px, auto) minmax(150px, auto);
+  align-items: center; gap: 12px;
+  padding: 6px 10px; border-radius: var(--radius);
+}
+.wf-row:hover { background: var(--surface); }
+.wf-col { font-family: var(--mono, ui-monospace, monospace); font-size: 12.5px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-bar { position: relative; height: 8px; border-radius: 4px; background: rgba(161, 28, 28, .18); overflow: hidden; }
+.wf-bar-clean { display: block; height: 100%; background: var(--good); border-radius: 4px 0 0 4px; }
+.wf-count { font-size: 12px; color: var(--text-dim); white-space: nowrap; }
+.wf-delta { font-size: 11.5px; font-weight: 600; text-align: right; white-space: nowrap; }
+.wf-delta.bad { color: var(--danger); }
+.wf-delta.ok { color: var(--good); }
+.wf-delta.neutral { color: var(--text-faint); font-weight: 400; }
+.wf-row-zero .wf-col { color: var(--danger); }
+
 /* ── band 2: the headline ─────────────────────────────────────────────────── */
 
 /* The one band that has to survive a five-second look: a sentence, a

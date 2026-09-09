@@ -193,10 +193,26 @@ number separates the cases that matter:
 | **All blank** | Nothing in any row | Drop it |
 | **Error** | The column could not be analysed | Decide by hand |
 
-The results lead with a headline — *3 of 9 columns need a business rule* — over a
-proportional track of the verdicts and the chips that filter by them. Clicking
-either isolates a pile. **Unexplained** is the one the tab exists for, and the
-table sorts it to the top by default, widest problem first.
+**The headline is about the record, not any one column.** Above the table, a run
+reports how many keys collapse to a single row once *every* checked column is
+considered together — e.g. *420 of 500 keys (84%) hold a real conflict once all
+6 checked columns are considered together*. That's a stricter question than any
+single column's verdict: a key can have every individual column come back
+Constant or Sparse and still fail to collapse, because different rows disagree
+on *different* columns from each other. The number comes from packing every
+checked column's value into one tuple per row and counting how many **distinct
+tuples** each key produces — one tuple means the whole record already agrees, so
+the key collapses with nothing lost; more than one means a real conflict lives
+somewhere in the row, and the per-column breakdown underneath is what tells you
+where. It's a domain-neutral question — "how many distinct versions of this
+record exist" means the same thing whether the key is an asset, an order or a
+customer — so it reads the same whether or not the dataset is a SAP extract.
+
+Underneath that headline, a proportional track of the per-column verdicts and
+the chips that filter by them break down *which* columns are behind the
+conflicts. Clicking a segment isolates a pile. **Unexplained** is the one the
+tab exists for, and the table sorts it to the top by default, widest problem
+first.
 
 Each row then carries the column, its verdict, a **split bar** — one proportional
 bar showing how the keys divide between agreeing, complementing, disagreeing and
@@ -242,8 +258,15 @@ carrying **ten real key values for every differing column** — with each one's 
 set of rows, the disagreeing cells highlighted, and a distinct-value count — and a
 sheet listing every column that never got a verdict and why. The **Export info**
 manifest records the key column, the columns you selected, whether sample mode was
-on, how deep the examples go, and the duplicate-grain finding — so the workbook
-explains how it was produced. CSV gives the summary table alone, with no examples.
+on, how deep the examples go, the duplicate-grain finding, and the same whole-record
+consistency figures as the on-screen headline — so the workbook explains how it was
+produced. CSV gives the summary table alone, with no examples.
+
+Each column's **"what to do when collapsing"** text names whichever column you
+actually picked as "Differences explained by" — "requires a business rule for
+which `depr_area` wins," not a fixed reference to depreciation area — so it reads
+correctly whatever the explanatory column is actually called, or if you leave
+it unset.
 
 ## Exporting
 

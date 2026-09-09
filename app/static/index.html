@@ -303,6 +303,11 @@
         <div class="progress-track"><div class="progress-fill" id="diff-progress-fill"></div></div>
       </div>
 
+      <!-- The funnel: how far does the key still narrow as columns are added,
+           one at a time, in the order they were checked? Leads the answer,
+           because it's the most direct way to see which column costs what. -->
+      <div class="diff-waterfall" id="diff-waterfall" hidden></div>
+
       <!-- The answer, headline first. -->
       <div class="diff-verdictbar" id="diff-verdictbar" hidden>
         <div class="vb-headline" id="diff-headline"></div>

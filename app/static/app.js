@@ -252,7 +252,13 @@ const railIsPicking = () => state.mode === 'diff';
    column that cannot also be one of the columns compared across them. */
 function pickableColumns() {
   if (!state.dataset) return [];
-  return state.dataset.columns.filter((c) => c.name !== state.diff.key);
+  // Neither role can also be one of the columns compared: the key groups the
+  // rows, and checking the explanatory column against itself is tautological
+  // — it always "explains" its own variation, so it never fails and never
+  // tells a reviewer anything. The server enforces this too; excluding it
+  // here keeps the rail's tick boxes from ever claiming otherwise.
+  return state.dataset.columns.filter((c) =>
+    c.name !== state.diff.key && c.name !== state.diff.explain);
 }
 
 function renderRail() {
@@ -323,12 +329,17 @@ function renderRail() {
     if (picking) {
       // The tick box leads, because in this view ticking is the whole point and
       // the eye would otherwise sit where the affordance is expected.
-      const box = el('span', `pick-box${isPicked ? ' on' : ''}${isKey ? ' locked' : ''}`,
-                     isKey ? '—' : (isPicked ? '✓' : ''));
+      const locked = isKey || isExplain;
+      const box = el('span', `pick-box${isPicked ? ' on' : ''}${locked ? ' locked' : ''}`,
+                     locked ? '—' : (isPicked ? '✓' : ''));
       item.append(box, badge, body, actions);
       if (isKey) {
         item.title = `${column.name} is the key this run groups by, so it is not one of `
           + 'the columns compared across the rows.';
+        item.onclick = () => {};
+      } else if (isExplain) {
+        item.title = `${column.name} is the explanatory column, so checking it against `
+          + 'itself would never tell you anything — it always "explains" its own variation.';
         item.onclick = () => {};
       } else {
         item.title = isPicked ? `Checked — click to leave ${column.name} out`
@@ -2420,7 +2431,7 @@ function suggestedDiffColumns() {
 
 function toggleDiffColumn(name) {
   const diff = state.diff;
-  if (name === diff.key) return;
+  if (name === diff.key || name === diff.explain) return;
   if (diff.include.has(name)) diff.include.delete(name);
   else diff.include.add(name);
   renderRail();
@@ -2625,6 +2636,56 @@ async function cancelDiff() {
   try { await api(`/api/diff/cancel/${diff.jobId}`, {}); } catch (error) { /* it ends anyway */ }
 }
 
+/* -- the funnel: how far does it narrow as columns are added? -- */
+
+function renderDiffWaterfall() {
+  const node = $('diff-waterfall');
+  const plan = state.diff.plan;
+  const steps = plan && plan.waterfall;
+  if (!steps || !steps.length) { node.hidden = true; return; }
+  node.hidden = false;
+  node.innerHTML = '';
+
+  node.append(
+    el('div', 'wf-title', 'How far does it narrow?'),
+    el('div', 'wf-sub', 'One column at a time, in the order you checked them — each row '
+      + 'can only hold steady or drop from the one above it, never climb back up.'),
+  );
+
+  const list = el('div', 'wf-list');
+  for (const step of steps) {
+    const row = el('div', 'wf-row');
+    row.title = `${fmtNum(step.keys_clean)} of ${fmtNum(step.keys_total)} keys `
+      + `(${step.clean_pct == null ? '—' : step.clean_pct}%) still collapse to one row once `
+      + `${fmtNum(step.columns_so_far)} column${step.columns_so_far === 1 ? '' : 's'} `
+      + `${step.columns_so_far === 1 ? 'is' : 'are'} considered together.`;
+
+    row.append(el('span', 'wf-col', step.column));
+
+    const bar = el('div', 'wf-bar');
+    const clean = el('span', 'wf-bar-clean');
+    clean.style.width = `${step.clean_pct || 0}%`;
+    bar.appendChild(clean);
+    row.appendChild(bar);
+
+    row.append(el('span', 'wf-count', `${fmtNum(step.keys_clean)} of ${fmtNum(step.keys_total)} collapse`));
+
+    let delta;
+    if (step.dropped === null) {
+      delta = el('span', 'wf-delta neutral', 'starting point');
+    } else if (step.dropped > 0) {
+      delta = el('span', 'wf-delta bad', `−${fmtNum(step.dropped)} because of this column`);
+    } else {
+      delta = el('span', 'wf-delta ok', 'no change');
+    }
+    row.appendChild(delta);
+
+    if (step.keys_clean === 0 && (step.dropped || 0) > 0) row.classList.add('wf-row-zero');
+    list.appendChild(row);
+  }
+  node.appendChild(list);
+}
+
 /* -- run-level findings -- */
 
 function renderDiffFindings() {
@@ -2642,6 +2703,26 @@ function renderDiffFindings() {
     row.appendChild(text);
     node.appendChild(row);
   };
+
+  // Headline first: does a key collapse to one record once every checked
+  // column is considered *together*, not one at a time? A column can look
+  // fine on its own and the row still not collapse — this is the number that
+  // actually answers "is there work here?"
+  const record = plan.record_consistency || {};
+  if (record.checked) {
+    if (!record.keys_conflicting) {
+      finding('good', '✓', `<b>Every key collapses to a single record.</b> `
+        + `All ${fmtNum(record.keys_total)} values of <b>${state.diff.key}</b> agree on all `
+        + `${fmtNum(record.columns_considered)} checked column${record.columns_considered === 1 ? '' : 's'} `
+        + `at once — safe to collapse to one row per key with nothing lost.`);
+    } else {
+      finding('warn', '⚠', `<b>${fmtNum(record.keys_conflicting)} of ${fmtNum(record.keys_total)} keys `
+        + `(${record.conflicting_pct}%) hold a real conflict</b> once every checked column is `
+        + `considered together — that can happen even when each column looks fine on its own. `
+        + `${fmtNum(record.keys_clean)} collapse cleanly. The table below shows which columns are `
+        + `behind it.`);
+    }
+  }
 
   const grain = plan.duplicate_grain || {};
   if (grain.checked && !grain.unique) {
@@ -2698,10 +2779,27 @@ function renderDiffVerdictBar() {
   const needsRule = VERDICTS_NEEDING_A_RULE.reduce((n, v) => n + (counts[v] || 0), 0);
   const unexplained = counts.TRUE_DIFF_OTHER || 0;
   const total = diff.results.length;
+  const record = (diff.plan && diff.plan.record_consistency) || {};
 
   const headline = $('diff-headline');
   headline.innerHTML = '';
-  if (!needsRule) {
+  if (record.checked) {
+    // Lead with the record-level question — can a key collapse to one row,
+    // *everything* considered at once? — and let the per-column breakdown
+    // below explain why, rather than the other way round.
+    if (!record.keys_conflicting) {
+      headline.append(el('b', 'ok', `All ${fmtNum(record.keys_total)} keys collapse to a single record.`),
+        el('span', 'hl-sub', ' Nothing here needs a business rule.'));
+    } else {
+      headline.append(
+        el('b', 'bad', `${fmtNum(record.keys_conflicting)} of ${fmtNum(record.keys_total)} keys `
+          + `(${record.conflicting_pct}%) hold a real conflict`),
+        el('span', 'hl-sub', ` once all ${fmtNum(record.columns_considered)} checked columns are `
+          + `considered together — ` + (needsRule
+              ? `${fmtNum(needsRule)} of them, below, need a business rule.`
+              : `see the columns below.`)));
+    }
+  } else if (!needsRule) {
     headline.append(el('b', 'ok', `All ${fmtNum(total)} columns can be collapsed mechanically.`),
       el('span', 'hl-sub', ' Nothing here needs a business rule.'));
   } else {
@@ -2805,6 +2903,7 @@ function renderDiffTable() {
   const head = $('diff-head');
   const body = $('diff-body');
   const diff = state.diff;
+  renderDiffWaterfall();
   renderDiffVerdictBar();
   $('diff-empty').hidden = diff.results.length > 0;
 
@@ -3050,7 +3149,13 @@ function wireDiff() {
   };
   $('diff-explain').onchange = () => {
     state.diff.explain = $('diff-explain').value;
+    // Same reasoning as the key: whatever was ticked before this was chosen
+    // as the explanatory column has to come back out, or a column picked
+    // under "All" (or ticked by hand) before this select was touched would
+    // stay checked despite comparing itself to itself.
+    state.diff.include.delete(state.diff.explain);
     renderRail();
+    renderDiffPicks();
     renderDiffRecap();
   };
   $('diff-sample').onchange = () => {
