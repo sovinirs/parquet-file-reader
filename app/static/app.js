@@ -241,10 +241,33 @@ function unmountDataset() {
 
 /* ─────────────────────────── columns rail ─────────────────────────── */
 
+/* The rail does two jobs, one per view. In Data and Pivot it decides what the
+   grid shows; in Difference it *is* the column picker for the run, because the
+   list of columns already lives here and asking someone to re-read seventy names
+   in a second box below the table was the worst thing about the old tab. */
+
+const railIsPicking = () => state.mode === 'diff';
+
+/* Everything the analysis could check: the key groups the rows, so it is the one
+   column that cannot also be one of the columns compared across them. */
+function pickableColumns() {
+  if (!state.dataset) return [];
+  return state.dataset.columns.filter((c) => c.name !== state.diff.key);
+}
+
 function renderRail() {
   const list = $('column-list');
   list.innerHTML = '';
   const needle = state.columnFilter.toLowerCase();
+  const picking = railIsPicking();
+  const diff = state.diff;
+
+  $('rail-title-text').textContent = picking ? 'Columns to check' : 'Columns';
+  $('rail-tools-data').hidden = picking;
+  $('rail-tools-diff').hidden = !picking;
+  $('column-count').textContent = picking
+    ? `${diff.include.size} of ${pickableColumns().length}`
+    : state.dataset.columns.length;
 
   for (const column of state.dataset.columns) {
     if (needle && !column.name.toLowerCase().includes(needle)) continue;
@@ -252,15 +275,24 @@ function renderRail() {
     const item = el('li', 'col-item');
     const isHidden = state.hidden.has(column.name);
     const isFiltered = Boolean(state.filters[column.name]);
+    const isKey = picking && column.name === diff.key;
+    const isExplain = picking && !!diff.explain && column.name === diff.explain;
+    const isPicked = picking && diff.include.has(column.name);
     if (isFiltered) item.classList.add('filtered');
-    if (isHidden) item.classList.add('hidden-col');
+    if (!picking && isHidden) item.classList.add('hidden-col');
+    if (picking) item.classList.add('picking');
+    if (isPicked) item.classList.add('picked');
+    if (isKey) item.classList.add('is-role');
 
     const badge = el('span', 'type-badge', TYPE_ABBR[column.category] || '?');
     badge.dataset.cat = column.category;
     badge.title = column.type;
 
     const body = el('div', 'col-body');
-    body.appendChild(el('div', 'col-name', column.name));
+    const nameRow = el('div', 'col-name', column.name);
+    if (isKey) nameRow.appendChild(el('span', 'role-tag key', 'KEY'));
+    else if (isExplain) nameRow.appendChild(el('span', 'role-tag explains', 'EXPLAINS'));
+    body.appendChild(nameRow);
     body.appendChild(el('div', 'col-type', column.type));
     body.title = `${column.name} · ${column.type}`;
 
@@ -272,21 +304,41 @@ function renderRail() {
       event.stopPropagation();
       openFilterPopover(column, filterBtn);
     };
+    actions.appendChild(filterBtn);
 
-    const eyeBtn = el('button', 'icon-btn', isHidden ? '𝅘' : '◉');
-    eyeBtn.title = isHidden ? 'Show column' : 'Hide column from preview and export';
-    eyeBtn.onclick = (event) => {
-      event.stopPropagation();
-      if (isHidden) state.hidden.delete(column.name);
-      else state.hidden.add(column.name);
-      renderRail();
-      renderExportColumns();
-      refresh({ countUnchanged: true });
-    };
+    if (!picking) {
+      const eyeBtn = el('button', 'icon-btn', isHidden ? '𝅘' : '◉');
+      eyeBtn.title = isHidden ? 'Show column' : 'Hide column from preview and export';
+      eyeBtn.onclick = (event) => {
+        event.stopPropagation();
+        if (isHidden) state.hidden.delete(column.name);
+        else state.hidden.add(column.name);
+        renderRail();
+        renderExportColumns();
+        refresh({ countUnchanged: true });
+      };
+      actions.appendChild(eyeBtn);
+    }
 
-    actions.append(filterBtn, eyeBtn);
-    item.append(badge, body, actions);
-    item.onclick = () => openFilterPopover(column, item);
+    if (picking) {
+      // The tick box leads, because in this view ticking is the whole point and
+      // the eye would otherwise sit where the affordance is expected.
+      const box = el('span', `pick-box${isPicked ? ' on' : ''}${isKey ? ' locked' : ''}`,
+                     isKey ? '—' : (isPicked ? '✓' : ''));
+      item.append(box, badge, body, actions);
+      if (isKey) {
+        item.title = `${column.name} is the key this run groups by, so it is not one of `
+          + 'the columns compared across the rows.';
+        item.onclick = () => {};
+      } else {
+        item.title = isPicked ? `Checked — click to leave ${column.name} out`
+                              : `Click to check ${column.name}`;
+        item.onclick = () => toggleDiffColumn(column.name);
+      }
+    } else {
+      item.append(badge, body, actions);
+      item.onclick = () => openFilterPopover(column, item);
+    }
 
     // Rail columns are drag sources for the pivot wells.
     item.draggable = true;
@@ -1066,8 +1118,8 @@ function renderDiffExportSummary(node) {
     ['Source', state.dataset.name],
     ['Grouped by', diff.key],
     ['Explained by', diff.explain || 'nothing — differences are not attributed'],
-    ['Assets analysed', diff.plan ? fmtNum(diff.plan.assets) : '—'],
-    ['Columns excluded', diff.plan ? fmtNum((diff.plan.excluded || []).length) : '—'],
+    [`${diff.key} values analysed`, diff.plan ? fmtNum(diff.plan.assets) : '—'],
+    ['Coverage', diff.sample ? `${fmtNum(diff.sample)} sampled` : 'every row'],
   ];
   for (const [label, value] of rows) {
     const row = el('div', 'summary-row');
@@ -1078,16 +1130,21 @@ function renderDiffExportSummary(node) {
   emph.append(el('span', null, 'Columns analysed'), el('span', null, fmtNum(diff.results.length)));
   node.appendChild(emph);
 
-  const unexplained = counts.TRUE_DIFF_OTHER || 0;
-  if (unexplained) {
+  const differing = VERDICTS_NEEDING_A_RULE.reduce((n, v) => n + (counts[v] || 0), 0);
+  if (differing) {
     const note = el('div', 'notice',
-      `${fmtNum(unexplained)} column${unexplained === 1 ? '' : 's'} vary in a way the `
-      + `${diff.explain || 'explanatory'} column does not explain. The workbook carries example `
-      + `rows for those so a reviewer can see the actual cases.`);
+      `${fmtNum(differing)} column${differing === 1 ? ' differs' : 's differ'} across the rows `
+      + `sharing a ${diff.key}. The Examples sheet carries ${DIFF_EXPORT_EXAMPLES} real `
+      + `${diff.key} values for each of them, with every one of their rows, so the verdict `
+      + `can be checked without going back to the file.`);
     note.hidden = false;
     node.appendChild(note);
   }
 }
+
+/* Kept in step with exporter.DIFF_EXPORT_EXAMPLE_ASSETS — the drawer promises
+   what the workbook delivers. */
+const DIFF_EXPORT_EXAMPLES = 10;
 
 function renderPivotExportSummary(node) {
   const pivotState = state.pivot;
@@ -1162,7 +1219,7 @@ function setDiffFormatOptions(diffMode) {
   }
   if (diffMode && !['xlsx', 'csv'].includes(select.value)) select.value = 'xlsx';
   select.options[1].textContent = diffMode
-    ? 'CSV (.csv) — the summary table only'
+    ? 'CSV (.csv) — the summary table only, no examples'
     : 'CSV (.csv) — fastest for huge results';
 }
 
@@ -1501,11 +1558,14 @@ function applyMode(mode) {
     renderWells();
   }
   if (mode === 'diff') {
-    // Building the config bar is all that happens on arrival: the analysis is
+    // Building the setup panel is all that happens on arrival: the analysis is
     // minutes of work, so it waits to be asked for.
-    loadDiffDefaults().then(buildDiffConfig);
+    loadDiffDefaults().then(() => { buildDiffConfig(); renderRail(); });
     buildDiffConfig();
   }
+  // The rail is the column picker in Difference and the visibility switch
+  // everywhere else, so every change of view redraws it.
+  if (state.dataset) renderRail();
 }
 
 /* -- the three wells -- */
@@ -2244,7 +2304,12 @@ wire();
 
 /* One run's worth of state. `results` grows while the job is still going, which
    is what lets the table fill in column by column instead of after five minutes
-   of a blank screen. */
+   of a blank screen.
+
+   `include` is the reviewer's ticked set and starts empty: a run over seventy
+   columns of an eleven-gigabyte extract is minutes of work, and nobody wants
+   sixty-four answers they never asked for. Picking in is the cheap direction --
+   you name the six columns you care about, rather than un-naming the rest. */
 function newDiffState() {
   return {
     jobId: null,
@@ -2253,12 +2318,13 @@ function newDiffState() {
     plan: null,
     key: null,
     explain: null,
-    exclude: new Set(),
+    include: new Set(),
     skipBlank: true,
     useFilters: false,
     sample: 10000,
+    setupOpen: true,
     verdictFilter: null,
-    sort: { by: 'verdict', desc: false },
+    sort: { by: 'verdict', desc: true },
     search: '',
     selected: null,
     examples: null,
@@ -2277,21 +2343,37 @@ const VERDICT_LABELS = {
   TRUE_DIFF_OTHER: 'Unexplained',
   ERROR: 'Error',
 };
-/* Read order, worst last: the unexplained pile is what the tab exists for, so it
-   sorts to the bottom where the eye lands after scanning. */
+/* What each verdict means for the person reading it, in one line. Shown under
+   the chips and in the drill-down, so the vocabulary is never a guess. */
+const VERDICT_BLURBS = {
+  CONSTANT: 'Every row of a key already agrees.',
+  SPARSE_SINGLE_VALUE: 'One value plus blanks — the rows fill each other in.',
+  ALL_BLANK: 'Nothing recorded anywhere.',
+  TRUE_DIFF_BY_DEPR_AREA: 'Values differ, but never inside one area.',
+  TRUE_DIFF_OTHER: 'Values differ in a way nothing here explains.',
+  ERROR: 'The column could not be analysed.',
+};
+/* Read order, worst last: the unexplained pile is what the tab exists for. The
+   table sorts this descending by default so that pile lands at the top, where
+   the eye starts. */
 const VERDICT_ORDER = ['CONSTANT', 'SPARSE_SINGLE_VALUE', 'ALL_BLANK',
                        'TRUE_DIFF_BY_DEPR_AREA', 'TRUE_DIFF_OTHER', 'ERROR'];
+/* The two verdicts that end with a person having to decide something. */
+const VERDICTS_NEEDING_A_RULE = ['TRUE_DIFF_OTHER', 'TRUE_DIFF_BY_DEPR_AREA'];
 
 let DIFF_DEFAULTS = null;
+
+const examplePageSize = () =>
+  (DIFF_DEFAULTS && DIFF_DEFAULTS.example_page_size) || 10;
 
 function loadDiffDefaults() {
   if (DIFF_DEFAULTS) return Promise.resolve(DIFF_DEFAULTS);
   return api('/api/diff/defaults', undefined, 'GET')
     .then((data) => { DIFF_DEFAULTS = data; return data; })
-    .catch(() => ({ excluded_columns: [], example_page_size: 5 }));
+    .catch(() => ({ excluded_columns: [], example_page_size: 10 }));
 }
 
-/* -- config bar -- */
+/* -- setup -- */
 
 function buildDiffConfig() {
   const diff = state.diff;
@@ -2302,7 +2384,7 @@ function buildDiffConfig() {
   const explainSelect = $('diff-explain');
   keySelect.innerHTML = '';
   explainSelect.innerHTML = '';
-  explainSelect.appendChild(el('option', null, 'None — do not attribute differences'));
+  explainSelect.appendChild(el('option', null, 'Nothing — do not attribute differences'));
   explainSelect.lastChild.value = '';
   for (const column of columns) {
     for (const select of [keySelect, explainSelect]) {
@@ -2320,34 +2402,97 @@ function buildDiffConfig() {
   keySelect.value = diff.key || '';
   explainSelect.value = diff.explain || '';
 
-  const preset = new Set(DIFF_DEFAULTS ? DIFF_DEFAULTS.excluded_columns : []);
-  diff.exclude = new Set(state.dataset.columns
-    .filter((c) => preset.has(c.name)).map((c) => c.name));
-  renderDiffExclusions();
+  // Nothing is checked to begin with, by design.
+  diff.include = new Set();
   diff.built = true;
-  renderDiffReadout();
+  setDiffSetupOpen(true);
+  renderDiffPicks();
 }
 
-function renderDiffExclusions() {
-  const box = $('diff-exclude');
+/* The columns the business already knows are worth checking: everything except
+   the run metadata and the period amounts that are *meant* to vary per area. */
+function suggestedDiffColumns() {
+  const known = new Set(DIFF_DEFAULTS ? DIFF_DEFAULTS.excluded_columns : []);
+  return pickableColumns()
+    .filter((c) => !known.has(c.name) && c.name !== state.diff.explain)
+    .map((c) => c.name);
+}
+
+function toggleDiffColumn(name) {
   const diff = state.diff;
-  box.innerHTML = '';
-  for (const column of state.dataset.columns) {
-    if (column.name === diff.key) continue;
-    const label = el('label', diff.exclude.has(column.name) ? 'on' : null);
-    const input = el('input');
-    input.type = 'checkbox';
-    input.checked = diff.exclude.has(column.name);
-    input.onchange = () => {
-      if (input.checked) diff.exclude.add(column.name);
-      else diff.exclude.delete(column.name);
-      label.classList.toggle('on', input.checked);
-      $('diff-exclude-count').textContent = `(${diff.exclude.size} selected)`;
-    };
-    label.append(input, el('span', null, column.name));
-    box.appendChild(label);
+  if (name === diff.key) return;
+  if (diff.include.has(name)) diff.include.delete(name);
+  else diff.include.add(name);
+  renderRail();
+  renderDiffPicks();
+}
+
+function setDiffColumns(names) {
+  state.diff.include = new Set(names);
+  renderRail();
+  renderDiffPicks();
+}
+
+/* Setup collapses once an answer exists: the question stops being the most
+   interesting thing on screen the moment the results land, and a 200px config
+   panel above a table the reviewer is trying to read is pure cost. */
+function setDiffSetupOpen(open) {
+  state.diff.setupOpen = open;
+  $('diff-setup-body').hidden = !open;
+  $('diff-setup').classList.toggle('collapsed', !open);
+  $('diff-setup-toggle').setAttribute('aria-expanded', String(open));
+  $('diff-setup-caret').textContent = open ? '▾' : '▸';
+  $('diff-setup-edit').textContent = open ? 'Hide' : 'Change';
+  renderDiffRecap();
+}
+
+function renderDiffRecap() {
+  const diff = state.diff;
+  const node = $('diff-setup-recap');
+  if (!diff.key) { node.textContent = 'Choose a key, then tick the columns to check.'; return; }
+  const bits = [
+    `one row per ${diff.key}`,
+    diff.explain ? `explained by ${diff.explain}` : 'differences not attributed',
+    `${fmtNum(diff.include.size)} column${diff.include.size === 1 ? '' : 's'} checked`,
+    diff.sample ? `${fmtNum(diff.sample)} assets` : 'every asset',
+  ];
+  if (diff.useFilters && activeFilters().length) bits.push('filtered rows only');
+  node.textContent = bits.join(' · ');
+}
+
+/* The tray: what is ticked, visible without scrolling the rail, and removable
+   in place. Seventy rail rows cannot answer "what did I pick?" at a glance. */
+function renderDiffPicks() {
+  const diff = state.diff;
+  const tray = $('diff-picked');
+  const total = pickableColumns().length;
+  tray.innerHTML = '';
+
+  $('diff-pick-count').textContent = diff.include.size
+    ? `${fmtNum(diff.include.size)} of ${fmtNum(total)}`
+    : 'none yet';
+  $('diff-pick-count').classList.toggle('empty', !diff.include.size);
+
+  if (!diff.include.size) {
+    tray.appendChild(el('span', 'tray-empty',
+      'No column is checked, so there is nothing to run yet.'));
+  } else {
+    // File order, not click order: the reviewer recognises the schema's order.
+    for (const column of state.dataset.columns) {
+      if (!diff.include.has(column.name)) continue;
+      const chip = el('span', 'picked-chip');
+      chip.append(el('span', 'pc-name', column.name));
+      const remove = el('button', 'pc-x', '×');
+      remove.title = `Leave ${column.name} out`;
+      remove.onclick = () => toggleDiffColumn(column.name);
+      chip.appendChild(remove);
+      tray.appendChild(chip);
+    }
   }
-  $('diff-exclude-count').textContent = `(${diff.exclude.size} selected)`;
+
+  $('btn-diff-run').disabled = !diff.include.size || !diff.key;
+  renderDiffRecap();
+  renderDiffReadout();
 }
 
 /* -- running -- */
@@ -2355,6 +2500,10 @@ function renderDiffExclusions() {
 async function runDiff() {
   const diff = state.diff;
   if (!diff.key) { toast('Choose the column that identifies one thing.', 'error'); return; }
+  if (!diff.include.size) {
+    toast('Tick at least one column in the Columns list.', 'error');
+    return;
+  }
 
   clearTimeout(diff.pollTimer);
   diff.results = [];
@@ -2365,6 +2514,7 @@ async function runDiff() {
   diff.verdictFilter = null;
   $('diff-detail').hidden = true;
   $('diff-findings').hidden = true;
+  $('diff-verdictbar').hidden = true;
   $('diff-empty').hidden = true;
   $('diff-head').innerHTML = '';
   $('diff-body').innerHTML = '';
@@ -2374,7 +2524,9 @@ async function runDiff() {
     dataset_id: state.dataset.id,
     key_column: diff.key,
     explain_column: diff.explain || null,
-    exclude: [...diff.exclude],
+    // The ticked set travels as an inclusion, so the manifest records the six
+    // columns the reviewer chose rather than the sixty-four they did not.
+    include: [...diff.include],
     sample_assets: diff.sample || null,
     exclude_all_blank: diff.skipBlank,
     // Sending the filters *is* the opt-in: what the run covered is then exactly
@@ -2446,7 +2598,7 @@ function renderDiffProgress(status) {
 function finishDiff(status) {
   const diff = state.diff;
   clearTimeout(diff.pollTimer);
-  $('btn-diff-run').disabled = false;
+  $('btn-diff-run').disabled = !diff.include.size || !diff.key;
   $('btn-diff-cancel').hidden = true;
   const fill = $('diff-progress-fill');
   fill.className = `progress-fill${status === 'error' ? ' error' : ' done'}`;
@@ -2459,6 +2611,10 @@ function finishDiff(status) {
       : `Analysed ${diff.results.length} column${diff.results.length === 1 ? '' : 's'}`;
     $('diff-progress-detail').textContent = diff.status
       ? fmtDuration(diff.status.elapsed) : '';
+    // Hand the screen over to the answer: collapse the setup, and fold the
+    // finished progress bar away rather than leave a full stripe above it.
+    if (diff.results.length) setDiffSetupOpen(false);
+    if (status === 'done' && diff.results.length) $('diff-progress').hidden = true;
   }
   renderDiffReadout();
 }
@@ -2509,24 +2665,86 @@ function renderDiffFindings() {
   // excluded would contradict the table right below.
   const blankNote = !blank ? ''
     : (state.diff.skipBlank
-        ? ` (${fmtNum(blank)} of them blank in every row)`
+        ? ` · <b>${fmtNum(blank)}</b> of them set aside as blank in every row`
         : ` · <b>${fmtNum(blank)}</b> blank in every row`);
   finding('', 'ⓘ', `<b>${fmtNum(plan.assets)} ${sampled ? 'sampled ' : ''}assets</b> across `
-    + `${fmtNum(plan.rows)} rows · <b>${fmtNum((plan.columns || []).length)}</b> columns analysed, `
-    + `<b>${fmtNum((plan.excluded || []).length)}</b> set aside` + blankNote
-    + (sampled ? ` · <b>sample mode</b> — percentages are an estimate, not the final answer.` : '.'));
+    + `${fmtNum(plan.rows)} rows · <b>${fmtNum((plan.columns || []).length)}</b> of the columns `
+    + `you checked reached a verdict` + blankNote
+    + (state.diff.status && state.diff.status.status === 'done'
+        ? ` · analysed in ${fmtDuration(state.diff.status.elapsed)}` : '')
+    + (sampled ? ` · <b>sample mode</b> — figures are an estimate, not the final answer.` : '.'));
+}
+
+/* -- the answer, headline first -- */
+
+function verdictCounts() {
+  const counts = {};
+  for (const record of state.diff.results) {
+    counts[record.verdict] = (counts[record.verdict] || 0) + 1;
+  }
+  return counts;
+}
+
+/* The bar above the table: one sentence saying what the run found, then a
+   proportional track and the chips that filter it. A reviewer should be able to
+   answer "is there work here?" without reading a single table row. */
+function renderDiffVerdictBar() {
+  const diff = state.diff;
+  const bar = $('diff-verdictbar');
+  bar.hidden = !diff.results.length;
+  if (!diff.results.length) return;
+
+  const counts = verdictCounts();
+  const needsRule = VERDICTS_NEEDING_A_RULE.reduce((n, v) => n + (counts[v] || 0), 0);
+  const unexplained = counts.TRUE_DIFF_OTHER || 0;
+  const total = diff.results.length;
+
+  const headline = $('diff-headline');
+  headline.innerHTML = '';
+  if (!needsRule) {
+    headline.append(el('b', 'ok', `All ${fmtNum(total)} columns can be collapsed mechanically.`),
+      el('span', 'hl-sub', ' Nothing here needs a business rule.'));
+  } else {
+    headline.append(
+      el('b', unexplained ? 'bad' : 'warn',
+         `${fmtNum(needsRule)} of ${fmtNum(total)} column${total === 1 ? '' : 's'} need a business rule`),
+      el('span', 'hl-sub', unexplained
+        ? ` — ${fmtNum(unexplained)} of them ${unexplained === 1 ? 'varies' : 'vary'} in a way `
+          + `${diff.explain || 'nothing here'} does not explain.`
+        : ` — every one of them is explained by ${diff.explain}.`));
+  }
+
+  const track = $('diff-vb-track');
+  track.innerHTML = '';
+  for (const verdict of VERDICT_ORDER) {
+    const count = counts[verdict] || 0;
+    if (!count) continue;
+    const seg = el('button', `vb-seg vd-${verdict}`);
+    seg.style.flexGrow = String(count);
+    seg.title = `${count} ${VERDICT_LABELS[verdict].toLowerCase()} — ${VERDICT_BLURBS[verdict]}`;
+    if (diff.verdictFilter && diff.verdictFilter !== verdict) seg.classList.add('muted');
+    seg.onclick = () => {
+      diff.verdictFilter = diff.verdictFilter === verdict ? null : verdict;
+      renderDiffTable();
+    };
+    if (count / total > 0.09) seg.appendChild(el('span', 'vb-seg-n', String(count)));
+    track.appendChild(seg);
+  }
+
+  renderDiffChips(counts);
 }
 
 /* -- the results table -- */
 
+/* Four percentage columns and a distinct-value count were five numbers standing
+   in for one question: how much of this column disagrees? The split bar answers
+   it at a glance and carries the exact counts in its tooltip, which leaves the
+   row wide enough for the recommendation — the thing anyone actually acts on. */
 const DIFF_COLUMNS = [
   { key: 'column', label: 'Column', sort: 'column' },
   { key: 'verdict', label: 'Verdict', sort: 'verdict' },
-  { key: 'constant_pct', label: 'Constant %', sort: 'constant_pct', num: true },
-  { key: 'sparse_pct', label: 'Sparse %', sort: 'sparse_pct', num: true },
-  { key: 'differing_pct', label: 'Differing %', sort: 'differing_pct', num: true },
-  { key: 'blank_pct', label: 'Blank %', sort: 'blank_pct', num: true },
-  { key: 'max_distinct', label: 'Max distinct', sort: 'max_distinct', num: true },
+  { key: 'split', label: 'How the keys split', sort: 'differing_pct' },
+  { key: 'differing', label: 'Keys that disagree', sort: 'differing', num: true },
   { key: 'recommendation', label: 'What to do when collapsing' },
 ];
 
@@ -2545,17 +2763,49 @@ function visibleDiffRows() {
     if (y === null || y === undefined) y = -1;
     if (x < y) return desc ? 1 : -1;
     if (x > y) return desc ? -1 : 1;
+    // Within one verdict the widest problem is the one to look at first.
+    if (by === 'verdict' && (b.differing || 0) !== (a.differing || 0)) {
+      return (b.differing || 0) - (a.differing || 0);
+    }
     return a.column.localeCompare(b.column);
   });
   return rows;
+}
+
+/* The four buckets as one proportional bar. Colours match the verdict dots, so
+   a row whose bar is mostly red reads the same way as its red tag. */
+const SPLIT_PARTS = [
+  ['constant', 'agree'],
+  ['sparse', 'one value plus blanks'],
+  ['differing', 'disagree'],
+  ['blank', 'blank'],
+];
+
+function splitBar(record) {
+  const wrap = el('div', 'split-bar');
+  const total = record.assets || 0;
+  if (!total) {
+    wrap.appendChild(el('span', 'split-none', '—'));
+    return wrap;
+  }
+  const parts = [];
+  for (const [key, word] of SPLIT_PARTS) {
+    const count = record[key] || 0;
+    if (!count) continue;
+    const seg = el('span', `split-seg sp-${key}`);
+    seg.style.flexGrow = String(count);
+    wrap.appendChild(seg);
+    parts.push(`${nf.format(count)} ${word}`);
+  }
+  wrap.title = `${nf.format(total)} keys: ${parts.join(' · ')}`;
+  return wrap;
 }
 
 function renderDiffTable() {
   const head = $('diff-head');
   const body = $('diff-body');
   const diff = state.diff;
-  renderDiffChips();
-  $('diff-toolbar').hidden = !diff.results.length;
+  renderDiffVerdictBar();
   $('diff-empty').hidden = diff.results.length > 0;
 
   head.innerHTML = '';
@@ -2577,27 +2827,32 @@ function renderDiffTable() {
   for (const record of visibleDiffRows()) {
     const row = el('tr', record.column === diff.selected ? 'selected' : null);
     row.onclick = () => openDiffColumn(record.column);
+    row.title = 'Open the example rows behind this verdict';
     for (const spec of DIFF_COLUMNS) {
       if (spec.key === 'verdict') {
         const td = el('td');
         td.appendChild(verdictTag(record.verdict));
         row.appendChild(td);
-        continue;
-      }
-      if (spec.key === 'column') {
+      } else if (spec.key === 'column') {
         row.appendChild(el('td', 'col-name', record.column));
-        continue;
+      } else if (spec.key === 'split') {
+        const td = el('td', 'split');
+        td.appendChild(splitBar(record));
+        row.appendChild(td);
+      } else if (spec.key === 'differing') {
+        const td = el('td', 'num');
+        const count = record.differing || 0;
+        td.appendChild(el('span', 'diff-count', count ? fmtNum(count) : '—'));
+        if (count && record.differing_pct !== null && record.differing_pct !== undefined) {
+          td.appendChild(el('span', 'diff-share', `${record.differing_pct.toFixed(1)}%`));
+        }
+        if (!count) td.classList.add('blank');
+        row.appendChild(td);
+      } else if (spec.key === 'recommendation') {
+        const td = el('td', 'rec', record.error || record.recommendation);
+        td.appendChild(el('span', 'rec-go', '›'));
+        row.appendChild(td);
       }
-      if (spec.key === 'recommendation') {
-        row.appendChild(el('td', 'rec', record.error || record.recommendation));
-        continue;
-      }
-      const value = record[spec.key];
-      const td = el('td', spec.num ? 'num' : null);
-      td.textContent = value === null || value === undefined ? '–'
-        : (spec.key.endsWith('_pct') ? `${value.toFixed(1)}%` : fmtNum(value));
-      if (value === null || value === undefined) td.classList.add('blank');
-      row.appendChild(td);
     }
     body.appendChild(row);
   }
@@ -2608,15 +2863,14 @@ function verdictTag(verdict) {
   const tag = el('span', `verdict-tag vt-${verdict}`);
   tag.append(el('span', `vt-dot vd-${verdict}`), document.createTextNode(
     VERDICT_LABELS[verdict] || verdict));
+  tag.title = VERDICT_BLURBS[verdict] || '';
   return tag;
 }
 
-function renderDiffChips() {
+function renderDiffChips(counts) {
   const node = $('diff-filter-chips');
   const diff = state.diff;
   node.innerHTML = '';
-  const counts = {};
-  for (const record of diff.results) counts[record.verdict] = (counts[record.verdict] || 0) + 1;
 
   const chip = (verdict, label, count) => {
     const item = el('div', 'verdict-chip');
@@ -2628,7 +2882,9 @@ function renderDiffChips() {
       diff.verdictFilter = diff.verdictFilter === verdict ? null : verdict;
       renderDiffTable();
     };
-    item.title = verdict ? `Show only ${label.toLowerCase()} columns` : 'Show every column';
+    item.title = verdict
+      ? `${VERDICT_BLURBS[verdict]} Click to show only these.`
+      : 'Show every column';
     node.appendChild(item);
   };
   chip(null, 'All', diff.results.length);
@@ -2642,11 +2898,13 @@ function renderDiffReadout() {
   const shown = diff.results.length ? visibleDiffRows().length : 0;
   $('diff-status-left').textContent = diff.results.length
     ? `${fmtNum(shown)} of ${fmtNum(diff.results.length)} columns shown`
-    : (state.dataset ? `${state.dataset.columns.length} columns in this file` : '');
+    : (state.dataset
+        ? `${fmtNum(diff.include.size)} of ${fmtNum(pickableColumns().length)} columns checked`
+        : '');
   const unexplained = diff.results.filter((r) => r.verdict === 'TRUE_DIFF_OTHER').length;
   $('diff-status-right').textContent = diff.results.length
     ? `${fmtNum(unexplained)} column${unexplained === 1 ? ' needs' : 's need'} a business rule`
-    : '';
+    : (diff.include.size ? 'Ready to run' : 'Tick the columns to check');
 }
 
 /* -- drill-down -- */
@@ -2657,9 +2915,34 @@ function openDiffColumn(column) {
   diff.exampleOffset = 0;
   diff.assetJump = '';
   $('diff-asset-jump').value = '';
+  $('diff-asset-jump').placeholder = `Jump to a ${diff.key} value…`;
   $('diff-detail').hidden = false;
   renderDiffTable();
   loadDiffExamples();
+}
+
+/* The counts live here rather than in the table: they matter once you have
+   chosen a column to look at, and five numeric columns across seventy rows is a
+   spreadsheet, not an answer. */
+function renderDiffDetailStats(record) {
+  const node = $('diff-detail-stats');
+  node.innerHTML = '';
+  const stat = (label, value, kind) => {
+    const cell = el('div', `dd-stat${kind ? ' ' + kind : ''}`);
+    cell.title = `${value} ${label}`;
+    cell.append(el('span', 'dd-stat-n', value), el('span', 'dd-stat-l', label));
+    node.appendChild(cell);
+  };
+  stat(`${state.diff.key} values`, fmtNum(record.assets));
+  stat('agree', fmtNum(record.constant), record.constant ? 'good' : null);
+  stat('one value + blanks', fmtNum(record.sparse));
+  stat('disagree', fmtNum(record.differing), record.differing ? 'bad' : null);
+  stat('blank throughout', fmtNum(record.blank));
+  if (record.conflicting_assets !== null && record.conflicting_assets !== undefined) {
+    stat(`disagree inside one ${state.diff.explain || 'group'}`,
+         fmtNum(record.conflicting_assets),
+         record.conflicting_assets ? 'bad' : 'good');
+  }
 }
 
 async function loadDiffExamples() {
@@ -2671,12 +2954,13 @@ async function loadDiffExamples() {
   sub.innerHTML = '';
   sub.appendChild(verdictTag(record.verdict));
   sub.append(document.createTextNode(' ' + (record.error || record.recommendation)));
+  renderDiffDetailStats(record);
 
   const body = $('diff-detail-body');
   body.innerHTML = '';
   body.appendChild(el('div', 'example-empty', 'Loading examples…'));
 
-  const page = DIFF_DEFAULTS ? DIFF_DEFAULTS.example_page_size : 5;
+  const page = examplePageSize();
   const query = new URLSearchParams({ limit: String(page), offset: String(diff.exampleOffset) });
   if (diff.assetJump) query.set('asset_id', diff.assetJump);
   try {
@@ -2695,26 +2979,42 @@ function renderDiffExamples() {
   const diff = state.diff;
   const body = $('diff-detail-body');
   const found = diff.examples;
+  const page = examplePageSize();
   body.innerHTML = '';
-  $('diff-ex-page').textContent = String(Math.floor(diff.exampleOffset / 5) + 1);
+  $('diff-ex-page').textContent = String(Math.floor(diff.exampleOffset / page) + 1);
   $('diff-ex-prev').disabled = diff.exampleOffset === 0 || !!diff.assetJump;
   $('diff-ex-next').disabled = !found || !found.has_more || !!diff.assetJump;
 
   if (!found || !found.assets.length) {
     body.appendChild(el('div', 'example-empty', diff.assetJump
-      ? `No rows for ${diff.assetJump}. Check the ID, or clear the box to page through examples.`
-      : 'No asset holds more than one value here — nothing to show.'));
+      ? `No rows for ${diff.assetJump}. Check the value, or clear the box to page through examples.`
+      : `No ${diff.key} holds more than one value here — nothing to show.`));
     return;
   }
+
+  body.appendChild(el('div', 'example-lede',
+    diff.assetJump ? `Every row of ${diff.assetJump}.`
+      : `${found.assets.length} example${found.assets.length === 1 ? '' : 's'}, `
+        + 'with every row behind each one.'));
 
   for (const asset of found.assets) {
     const block = el('div', 'example-asset');
     const head = el('div', 'example-head');
     head.append(el('span', 'example-id', String(asset.asset)),
-                el('span', 'example-note', asset.differs
+                el('span', `example-note${asset.differs ? ' differs' : ''}`, asset.differs
                   ? `${asset.distinct_values.length} different values`
                   : 'rows agree'));
     block.appendChild(head);
+
+    // The distinct values on their own line: what the disagreement actually is,
+    // without reading down a column of repeated rows to work it out.
+    if (asset.differs) {
+      const values = el('div', 'example-values');
+      for (const value of asset.distinct_values) {
+        values.appendChild(el('span', 'value-chip', String(value)));
+      }
+      block.appendChild(values);
+    }
 
     const table = el('table', 'example-table');
     const thead = el('tr');
@@ -2739,17 +3039,42 @@ function renderDiffExamples() {
 function wireDiff() {
   $('tab-diff').onclick = () => setMode('diff');
 
+  $('diff-setup-toggle').onclick = () => setDiffSetupOpen(!state.diff.setupOpen);
+
   $('diff-key').onchange = () => {
     state.diff.key = $('diff-key').value;
-    state.diff.exclude.delete(state.diff.key);
-    renderDiffExclusions();
+    // The key groups the rows; it cannot also be compared across them.
+    state.diff.include.delete(state.diff.key);
+    renderRail();
+    renderDiffPicks();
   };
-  $('diff-explain').onchange = () => { state.diff.explain = $('diff-explain').value; };
+  $('diff-explain').onchange = () => {
+    state.diff.explain = $('diff-explain').value;
+    renderRail();
+    renderDiffRecap();
+  };
   $('diff-sample').onchange = () => {
     state.diff.sample = parseInt($('diff-sample').value, 10) || null;
+    renderDiffRecap();
   };
   $('diff-skip-blank').onchange = () => { state.diff.skipBlank = $('diff-skip-blank').checked; };
-  $('diff-use-filters').onchange = () => { state.diff.useFilters = $('diff-use-filters').checked; };
+  $('diff-use-filters').onchange = () => {
+    state.diff.useFilters = $('diff-use-filters').checked;
+    renderDiffRecap();
+  };
+
+  // The same three shortcuts sit in the rail and in the setup step, because the
+  // reviewer's eye is in one place or the other and neither should send them
+  // hunting for the other.
+  const pickAll = () => setDiffColumns(pickableColumns().map((c) => c.name));
+  const pickNone = () => setDiffColumns([]);
+  const pickSuggested = () => setDiffColumns(suggestedDiffColumns());
+  for (const [id, fn] of [['diff-pick-all', pickAll], ['btn-rail-all', pickAll],
+                          ['diff-pick-none', pickNone], ['btn-rail-none', pickNone],
+                          ['diff-pick-suggested', pickSuggested],
+                          ['btn-rail-suggested', pickSuggested]]) {
+    $(id).onclick = fn;
+  }
 
   $('btn-diff-run').onclick = runDiff;
   $('btn-diff-cancel').onclick = cancelDiff;
@@ -2765,13 +3090,11 @@ function wireDiff() {
     renderDiffTable();
   };
   $('diff-ex-prev').onclick = () => {
-    const page = DIFF_DEFAULTS ? DIFF_DEFAULTS.example_page_size : 5;
-    state.diff.exampleOffset = Math.max(0, state.diff.exampleOffset - page);
+    state.diff.exampleOffset = Math.max(0, state.diff.exampleOffset - examplePageSize());
     loadDiffExamples();
   };
   $('diff-ex-next').onclick = () => {
-    const page = DIFF_DEFAULTS ? DIFF_DEFAULTS.example_page_size : 5;
-    state.diff.exampleOffset += page;
+    state.diff.exampleOffset += examplePageSize();
     loadDiffExamples();
   };
   let jumpTimer = null;

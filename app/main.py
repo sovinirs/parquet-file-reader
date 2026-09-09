@@ -104,6 +104,9 @@ class DiffStartRequest(BaseModel):
     dataset_id: str
     key_column: str
     explain_column: Optional[str] = None
+    # Omitted means "every column", which is what the analysis did before the
+    # picker existed; a list is the reviewer's ticked set.
+    include: Optional[List[str]] = None
     exclude: List[str] = Field(default_factory=list)
     sample_assets: Optional[int] = None
     exclude_all_blank: bool = True
@@ -483,6 +486,7 @@ def start_diff(request: DiffStartRequest) -> Dict[str, Any]:
     config = DiffConfig(
         key_column=request.key_column,
         explain_column=request.explain_column,
+        include=request.include,
         exclude=request.exclude,
         sample_assets=request.sample_assets,
         filters=request.filters,

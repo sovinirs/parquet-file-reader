@@ -1140,35 +1140,157 @@ a.btn { display: inline-flex; align-items: center; justify-content: center; }
 
 /* ============================================================
    Difference analysis
+
+   Three bands, in the order the work happens: set it up, read the headline,
+   then read the rows. Only one of them is expensive in screen space, and it is
+   the one that collapses once it has done its job.
    ============================================================ */
 
-.diff-config { padding: 14px 18px 12px; border-bottom: 1px solid var(--border); background: var(--bg-raised); }
-.diff-config-row { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 12px; }
-.diff-config-row:last-of-type { margin-bottom: 10px; }
-.field.inline.wide { min-width: 260px; }
-.field.inline.grow { flex: 1; min-width: 300px; }
-.field.inline em { color: var(--text-faint); font-style: normal; font-weight: 400; }
-.diff-config-side { display: flex; flex-direction: column; gap: 2px; min-width: 300px; }
-.diff-actions { display: flex; gap: 8px; margin-top: 6px; }
+/* ── the rail as column picker ────────────────────────────────────────────── */
 
-/* Exclusions: a scrolling box of checkboxes beats a multi-select nobody can
-   read, and it shows what is already ticked without opening anything. */
-.exclude-box {
-  max-height: 108px; overflow-y: auto; border: 1px solid var(--border);
-  border-radius: var(--radius); background: var(--bg-sunken); padding: 6px 8px;
-  display: flex; flex-wrap: wrap; gap: 2px 14px; align-content: flex-start;
+/* In the Difference view the rail stops being a visibility switch and becomes
+   the run's column picker, so a tick box leads the row and the whole row is the
+   hit target. */
+.col-item.picking { grid-template-columns: auto auto minmax(0, 1fr) auto; }
+.col-item.picked { box-shadow: inset var(--beam) 0 0 0 var(--accent); }
+.col-item.picked .col-name { color: var(--text); font-weight: 600; }
+.col-item.is-role { cursor: default; opacity: .72; }
+.col-item.is-role:hover { background: none; }
+
+.pick-box {
+  width: 17px; height: 17px; flex-shrink: 0;
+  display: grid; place-items: center;
+  border: 1px solid var(--border-strong); background: var(--bg-sunken);
+  color: transparent; font-size: 11px; font-weight: 700; line-height: 1;
 }
-.exclude-box label {
-  display: flex; align-items: center; gap: 6px; font-size: 12px;
-  color: var(--text-dim); cursor: pointer; white-space: nowrap;
+.col-item:hover .pick-box { border-color: var(--text-faint); }
+.pick-box.on { background: var(--accent); border-color: var(--accent-deep); color: var(--accent-ink); }
+.pick-box.locked { border-style: dashed; color: var(--text-faint); background: none; }
+
+/* Which column plays which part in the run, said where the columns are. */
+.role-tag {
+  display: inline-block; margin-left: 7px; padding: 0 5px;
+  font-size: 9px; font-weight: 700; letter-spacing: .06em;
+  border: 1px solid var(--border-strong); color: var(--text-faint);
+  vertical-align: 1px;
 }
-.exclude-box label:hover { color: var(--text); }
-.exclude-box input { accent-color: var(--accent); }
-.exclude-box label.on { color: var(--accent-text); }
+.role-tag.key { border-color: var(--accent-deep); color: var(--accent-text); }
+
+/* ── band 1: setup ────────────────────────────────────────────────────────── */
+
+.diff-setup { border-bottom: 1px solid var(--border); background: var(--bg-raised); }
+
+.setup-bar {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 10px 18px; background: none; border: 0; border-left: var(--beam) solid transparent;
+  color: var(--text); font: inherit; font-size: 12.5px; text-align: left; cursor: pointer;
+}
+.setup-bar:hover { background: var(--surface-hover); }
+.diff-setup.collapsed .setup-bar { border-left-color: var(--accent); }
+.setup-caret { color: var(--text-faint); font-size: 10px; width: 10px; }
+.setup-step {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em;
+  color: var(--text-faint); flex-shrink: 0;
+}
+.setup-recap {
+  flex: 1; min-width: 0; color: var(--text-dim);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.setup-edit { color: var(--accent-text); font-weight: 600; flex-shrink: 0; }
+
+.setup-body { padding: 4px 18px 14px; }
+
+/* Numbered steps: the setup is a sequence — what is one thing, which columns,
+   how much of the file — and reads as one rather than as a wall of controls. */
+.setup-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.setup-item { display: flex; gap: 12px; padding: 10px 0; border-top: 1px solid var(--border); }
+.setup-item:first-child { border-top: 0; }
+.step-mark {
+  width: 20px; height: 20px; flex-shrink: 0; margin-top: 1px;
+  display: grid; place-items: center;
+  border: 1px solid var(--border-strong); background: var(--bg-sunken);
+  font-size: 11px; font-weight: 700; color: var(--text-faint);
+}
+.step-main { flex: 1; min-width: 0; }
+.step-title { font-size: 12.5px; font-weight: 600; margin-bottom: 8px; display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.step-count {
+  padding: 1px 8px; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums;
+  background: var(--accent); color: var(--accent-ink); border: 1px solid var(--accent-deep);
+}
+.step-count.empty { background: none; color: var(--text-faint); border-color: var(--border-strong); font-weight: 500; }
+.step-hint { font-size: 12px; color: var(--text-dim); line-height: 1.6; margin-bottom: 8px; }
+.step-hint b { color: var(--text); }
+.pick-actions { display: inline-flex; align-items: center; gap: 7px; margin-left: 4px; }
+.step-fields { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+.step-checks { display: flex; flex-direction: column; gap: 3px; padding-top: 2px; }
+.field.inline.wide { min-width: 260px; }
+.field.inline em { color: var(--text-faint); font-style: normal; font-weight: 400; }
+
+/* The tray answers "what did I pick?" without scrolling seventy rail rows. */
+.picked-tray {
+  display: flex; flex-wrap: wrap; gap: 5px;
+  max-height: 96px; overflow-y: auto;
+}
+.tray-empty { font-size: 12px; color: var(--text-faint); font-style: italic; }
+.picked-chip {
+  display: inline-flex; align-items: center; gap: 2px;
+  border: 1px solid var(--border-strong); background: var(--surface);
+  font-size: 11.5px; padding: 2px 2px 2px 8px; max-width: 260px;
+}
+.picked-chip .pc-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picked-chip .pc-x {
+  border: 0; background: none; color: var(--text-faint); cursor: pointer;
+  font-size: 14px; line-height: 1; padding: 0 5px;
+}
+.picked-chip .pc-x:hover { color: var(--danger); }
+
+.setup-foot {
+  display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+  padding-top: 12px; border-top: 1px solid var(--border);
+}
+.setup-note { flex: 1; min-width: 260px; font-size: 12px; color: var(--text-faint); line-height: 1.5; }
+.diff-actions { display: flex; gap: 8px; }
 
 .diff-progress { padding: 12px 18px; border-bottom: 1px solid var(--border); background: var(--bg-raised); }
 
-/* Run-level findings sit above the table because they change how it reads. */
+/* ── band 2: the headline ─────────────────────────────────────────────────── */
+
+/* The one band that has to survive a five-second look: a sentence, a
+   proportional track, and the chips that filter by verdict. */
+.diff-verdictbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "headline tools" "track track" "legend legend";
+  gap: 10px 18px; align-items: center;
+  padding: 13px 18px; border-bottom: 1px solid var(--border); background: var(--bg-raised);
+}
+.vb-headline { grid-area: headline; font-size: 13.5px; line-height: 1.5; }
+.vb-headline b { font-weight: 700; }
+.vb-headline b.bad  { color: var(--danger); }
+.vb-headline b.warn { color: var(--accent-text); }
+.vb-headline b.ok   { color: var(--good); }
+.vb-headline .hl-sub { color: var(--text-dim); }
+.vb-tools { grid-area: tools; display: flex; align-items: center; gap: 8px; }
+.vb-tools .input { width: 190px; }
+.vb-legend { grid-area: legend; display: flex; flex-wrap: wrap; gap: 6px; }
+
+.vb-track { grid-area: track; display: flex; height: 12px; gap: 2px; }
+.vb-seg {
+  border: 0; padding: 0; cursor: pointer; min-width: 4px;
+  display: grid; place-items: center; position: relative;
+  transition: opacity .12s;
+}
+.vb-seg:hover { opacity: .8; }
+.vb-seg.muted { opacity: .3; }
+.vb-seg-n {
+  font-size: 9px; font-weight: 700; color: var(--accent-ink);
+  font-variant-numeric: tabular-nums; line-height: 1;
+}
+/* Segments that sit on a dark fill need light ink instead. */
+.vb-seg.vd-TRUE_DIFF_OTHER .vb-seg-n, .vb-seg.vd-ERROR .vb-seg-n { color: #fff; }
+.vb-seg.vd-ALL_BLANK .vb-seg-n { color: var(--bg-raised); }
+
+/* Run-level findings sit under the headline: they qualify it rather than lead. */
 .diff-findings { padding: 12px 18px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
 .finding { display: flex; gap: 10px; align-items: flex-start; font-size: 12.5px; padding: 9px 12px; border-radius: var(--radius); border: 1px solid var(--border); background: var(--surface); }
 .finding .finding-mark { font-size: 14px; line-height: 1.2; }
@@ -1180,8 +1302,6 @@ a.btn { display: inline-flex; align-items: center; justify-content: center; }
 .finding.good { border-color: var(--border); border-left: var(--beam) solid var(--good); background: rgba(30, 202, 58, .08); }
 .finding.good .finding-mark { color: var(--good); }
 .finding-text { flex: 1; color: var(--text-dim); line-height: 1.5; }
-
-.diff-toolbar { display: flex; align-items: center; gap: 12px; padding: 10px 18px; border-bottom: 1px solid var(--border); }
 
 /* Verdict chips double as the filter: clicking one isolates that pile, which is
    how a reviewer gets to the unexplained set without reading 70 rows. */
@@ -1207,17 +1327,43 @@ a.btn { display: inline-flex; align-items: center; justify-content: center; }
 .vd-ALL_BLANK              { background: var(--text-faint); }
 .vd-ERROR                  { background: var(--danger); }
 
+/* ── band 3: the rows ─────────────────────────────────────────────────────── */
+
 .diff-split { display: flex; flex: 1; min-height: 0; }
 .diff-split .table-wrap { flex: 1; min-width: 0; }
 
-.diff-grid td, .diff-grid th { white-space: nowrap; }
+.diff-grid td, .diff-grid th { white-space: nowrap; vertical-align: middle; }
+.diff-grid thead th { padding: 8px 12px; }
+.diff-grid tbody td { padding: 8px 12px; }
 .diff-grid tbody tr { cursor: pointer; }
 .diff-grid tbody tr:hover { background: var(--surface-hover); }
-.diff-grid tbody tr.selected { background: var(--accent-soft); }
+.diff-grid tbody tr.selected { background: var(--accent-soft); box-shadow: inset var(--beam) 0 0 0 var(--accent); }
 .diff-grid .col-name { font-weight: 600; color: var(--text); }
-.diff-grid .rec { white-space: normal; color: var(--text-dim); min-width: 300px; font-size: 12px; }
 .diff-grid th.sortable { cursor: pointer; user-select: none; }
 .diff-grid th.sortable:hover { color: var(--accent-text); }
+
+/* One bar in place of four percentage columns: the shape of a column's
+   agreement is a proportion, and a proportion is a length, not five numbers.
+   The exact counts live in the tooltip and in the drill-down panel. */
+.diff-grid td.split { width: 170px; }
+.split-bar { display: flex; height: 9px; width: 150px; gap: 1px; background: var(--bg-sunken); }
+.split-seg { min-width: 2px; }
+.sp-constant  { background: var(--good); }
+.sp-sparse    { background: var(--info); }
+.sp-differing { background: var(--danger); }
+.sp-blank     { background: var(--border-strong); opacity: .55; }
+.split-none { color: var(--text-faint); font-size: 12px; }
+
+.diff-grid .diff-count { font-weight: 600; font-variant-numeric: tabular-nums; }
+.diff-grid .diff-share { color: var(--text-faint); font-size: 11px; margin-left: 6px; font-variant-numeric: tabular-nums; }
+.diff-grid td.num.blank .diff-count { font-weight: 400; color: var(--text-faint); }
+
+/* The recommendation is the widest thing in the row and the first to be squeezed
+   when the drill-down opens; 230px still holds two comfortable lines, and the
+   table scrolls rather than clipping if the window is narrower still. */
+.diff-grid .rec { white-space: normal; color: var(--text-dim); min-width: 230px; max-width: 420px; font-size: 12px; position: relative; padding-right: 26px; }
+.diff-grid .rec-go { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); color: var(--text-faint); font-size: 15px; opacity: 0; transition: opacity .12s; }
+.diff-grid tbody tr:hover .rec-go, .diff-grid tbody tr.selected .rec-go { opacity: 1; color: var(--accent-text); }
 
 .verdict-tag {
   display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px;
@@ -1232,23 +1378,54 @@ a.btn { display: inline-flex; align-items: center; justify-content: center; }
 .vt-ALL_BLANK              { background: var(--null-bg);           color: var(--text-faint); border-color: var(--border); }
 .vt-ERROR                  { background: rgba(161, 28, 28, .2);    color: var(--danger); border-color: rgba(161, 28, 28, .5); }
 
-/* Drill-down: the point of the whole tab, so it gets real estate rather than a
-   popover, and stays open while the reviewer moves down the list. */
+/* ── drill-down ───────────────────────────────────────────────────────────── */
+
+/* The point of the whole tab, so it gets real estate rather than a popover, and
+   stays open while the reviewer moves down the list. */
 .diff-detail {
-  width: 420px; flex-shrink: 0; border-left: 1px solid var(--border);
+  width: 460px; flex-shrink: 0; border-left: 1px solid var(--border);
   background: var(--bg-raised); display: flex; flex-direction: column; min-height: 0;
 }
-.diff-detail-head { display: flex; align-items: flex-start; gap: 10px; padding: 14px 16px 10px; border-bottom: 1px solid var(--border); }
-.diff-detail-title { font-weight: 700; font-size: 13.5px; }
-.diff-detail-sub { font-size: 12px; color: var(--text-dim); margin-top: 3px; line-height: 1.45; }
+.diff-detail-head { display: flex; align-items: flex-start; gap: 10px; padding: 14px 16px 12px; }
+.dd-heading { flex: 1; min-width: 0; }
+.diff-detail-title { font-weight: 700; font-size: 14px; word-break: break-word; }
+.diff-detail-sub { font-size: 12px; color: var(--text-dim); margin-top: 5px; line-height: 1.5; }
+
+/* The counts belong here, not in the table: they matter once a column has been
+   chosen, and five numeric columns across seventy rows is a spreadsheet. */
+.diff-detail-stats {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px; background: var(--border); border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+.dd-stat { background: var(--bg-raised); padding: 8px 12px; min-width: 0; }
+.dd-stat-n { display: block; font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.dd-stat-l { display: block; font-size: 10.5px; color: var(--text-faint); margin-top: 1px;
+             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dd-stat.good .dd-stat-n { color: var(--good); }
+.dd-stat.bad  .dd-stat-n { color: var(--danger); }
+
 .diff-detail-tools { display: flex; gap: 10px; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--border); }
 .diff-detail-tools .input { flex: 1; }
 .diff-detail-body { overflow-y: auto; padding: 12px 16px 20px; flex: 1; }
+.example-lede { font-size: 11.5px; color: var(--text-faint); margin-bottom: 12px; }
 
-.example-asset { margin-bottom: 16px; }
+.example-asset { margin-bottom: 18px; }
 .example-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 5px; }
 .example-id { font-family: var(--mono, ui-monospace, monospace); font-size: 12px; font-weight: 600; }
 .example-note { font-size: 11.5px; color: var(--text-faint); }
+.example-note.differs { color: var(--danger); font-weight: 600; }
+
+/* The disagreement itself, stated once, rather than inferred by reading down a
+   column of repeated rows. */
+.example-values { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+.value-chip {
+  font-family: var(--mono, ui-monospace, monospace); font-size: 11px;
+  padding: 1px 7px; border: 1px solid rgba(161, 28, 28, .45); color: var(--danger);
+  background: rgba(161, 28, 28, .1); max-width: 200px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
 .example-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .example-table th { text-align: left; font-weight: 600; color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; padding: 4px 8px; border-bottom: 1px solid var(--border); }
 .example-table td { padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
@@ -1258,3 +1435,10 @@ a.btn { display: inline-flex; align-items: center; justify-content: center; }
 .example-table tr.differs td.val { background: rgba(161, 28, 28, .15); color: var(--danger); font-weight: 600; }
 .example-table td.val.blank { color: var(--text-faint); font-style: italic; font-weight: 400; background: none; }
 .example-empty { font-size: 12.5px; color: var(--text-dim); line-height: 1.5; }
+
+/* Narrow windows: the drill-down stops competing with the table for width. */
+@media (max-width: 1180px) {
+  .diff-detail { width: 360px; }
+  .diff-detail-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .vb-tools .input { width: 140px; }
+}

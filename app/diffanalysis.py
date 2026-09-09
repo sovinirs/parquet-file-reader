@@ -73,8 +73,10 @@ DEFAULT_EXCLUDED_COLUMNS = (
     "FIXED_ASSET_QTY",
 )
 
-# Example assets fetched per drill-down page.
-DEFAULT_EXAMPLE_ASSETS = 5
+# Example assets fetched per drill-down page, and written per column into the
+# exported workbook. Ten is the number a reviewer needs to believe a verdict:
+# three can be a coincidence, fifty is a data dump nobody reads.
+DEFAULT_EXAMPLE_ASSETS = 10
 MAX_EXAMPLE_ASSETS = 50
 
 
@@ -93,6 +95,12 @@ class DiffConfig:
 
     key_column: str
     explain_column: Optional[str] = None
+    # The picked set. `None` means "every column", which is what a caller that
+    # predates the picker gets; a list means only those. Expressed as an
+    # inclusion rather than an exclusion because that is the choice the reviewer
+    # actually makes -- on a 70-column extract they want six of them, and
+    # writing down the sixty-four they did not want records nothing useful.
+    include: Optional[Sequence[str]] = None
     exclude: Sequence[str] = ()
     sample_assets: Optional[int] = None
     filters: Sequence[Dict[str, Any]] = ()
@@ -102,6 +110,7 @@ class DiffConfig:
         return {
             "key_column": self.key_column,
             "explain_column": self.explain_column,
+            "include": None if self.include is None else list(self.include),
             "exclude": list(self.exclude),
             "sample_assets": self.sample_assets,
             "filters": list(self.filters),
@@ -230,6 +239,13 @@ def _validate(dataset: Dataset, config: DiffConfig) -> None:
                 "{!r} cannot explain variation within itself.".format(config.key_column))
     if config.sample_assets is not None and int(config.sample_assets) < 1:
         raise DiffError("The sample size must be at least one asset.")
+    if config.include is not None:
+        picked = [name for name in config.include
+                  if name in types and name != config.key_column]
+        if not picked:
+            raise DiffError(
+                "No column is selected for the analysis. Tick the columns to check "
+                "in the Columns list.")
 
 
 # --------------------------------------------------------------- run preparation
@@ -313,11 +329,17 @@ def prepare(engine: Engine, dataset: Dataset, config: DiffConfig) -> RunPlan:
     _validate(dataset, config)
     excluded: List[Dict[str, str]] = []
     requested = {name for name in config.exclude if name in dataset.column_types}
+    # `None` keeps the pre-picker behaviour of analysing everything; a set means
+    # the reviewer chose, and anything outside it is reported as not chosen
+    # rather than silently missing from the results.
+    picked = None if config.include is None else set(config.include)
     candidates: List[str] = []
     for column in dataset.columns:
         name = column.name
         if name == config.key_column:
             excluded.append({"column": name, "reason": "Grouping key"})
+        elif picked is not None and name not in picked:
+            excluded.append({"column": name, "reason": "Not selected for this run"})
         elif name in requested:
             excluded.append({"column": name, "reason": "Excluded by the run configuration"})
         else:

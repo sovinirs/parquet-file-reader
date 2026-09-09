@@ -162,10 +162,24 @@ depreciation area), where the business wants one row per asset. Asset ID alone
 defines uniqueness, so every other column has to be checked: do the rows sharing
 an asset agree, and if not, why not?
 
-Pick the column that identifies one thing (**Group by**) and the column that
-ought to explain any variation (**Explained by**), then press **Run analysis**.
-Nothing runs on its own — this reads the file once per column and takes minutes
-on a large extract.
+Setup is three numbered steps. Say which column identifies one thing (**One row
+per**) and which column ought to explain any variation (**Differences explained
+by**); tick the columns you want checked; choose how much of the file to cover.
+Then press **Run analysis** — nothing runs on its own, because this reads the
+file once per selected column and takes minutes on a large extract.
+
+**The Columns rail on the left is the picker.** In the Difference tab every rail
+row grows a tick box, and nothing starts ticked: you name the handful of columns
+you care about rather than un-naming the sixty you don't. The key column is
+marked `KEY` and cannot be ticked — it groups the rows, so it is not one of the
+columns compared across them. **Suggested** ticks everything except the run
+metadata and the period amounts that are *meant* to vary per area; **All** and
+**Clear** do what they say. What is ticked also shows as a removable chip in step
+2, so "what did I pick?" never means scrolling seventy rail rows.
+
+Once a run finishes the setup folds into a one-line recap (`one row per asset_id
+· explained by depr_area · 12 columns checked · every asset`) and the results
+take the screen. **Change** reopens it.
 
 For each column, per asset, it counts the **distinct non-blank values**. That one
 number separates the cases that matter:
@@ -179,8 +193,18 @@ number separates the cases that matter:
 | **All blank** | Nothing in any row | Drop it |
 | **Error** | The column could not be analysed | Decide by hand |
 
-**Unexplained** is the pile the tab exists for, and the verdict chips above the
-table isolate it in one click.
+The results lead with a headline — *3 of 9 columns need a business rule* — over a
+proportional track of the verdicts and the chips that filter by them. Clicking
+either isolates a pile. **Unexplained** is the one the tab exists for, and the
+table sorts it to the top by default, widest problem first.
+
+Each row then carries the column, its verdict, a **split bar** — one proportional
+bar showing how the keys divide between agreeing, complementing, disagreeing and
+blank, with the exact counts on hover — the number of keys that disagree, and
+what to do about it when collapsing. The bar replaced four percentage columns and
+a distinct-value count: how much of a column disagrees is a proportion, and a
+proportion reads faster as a length than as five numbers. The counts themselves
+live in the drill-down, where they matter.
 
 Some things worth knowing about how it gets there:
 
@@ -207,16 +231,19 @@ pass. Turn on **Only analyse the rows my filters match** to scope a run to
 whatever the filter chips currently select.
 
 Selecting a column opens the drill-down, which is the piece that makes this land
-with a business reviewer: real assets, one row per depreciation area, with the
-cells that disagree highlighted. Page through more examples, or type an asset ID
-to jump straight to a case someone has asked about.
+with a business reviewer: the counts behind the verdict, then **ten real assets**
+per page, each with the distinct values named once and then every one of its rows,
+with the cells that disagree highlighted. Page through more examples, or type an
+asset ID to jump straight to a case someone has asked about.
 
 **Export** writes a workbook with a summary sheet (one row per column, every
-metric, colour-coded by verdict as conditional formatting), an examples sheet of
-real differing rows, and a sheet listing every excluded column and why. The
-**Export info** manifest records the key column, the exclusions, whether sample
-mode was on, and the duplicate-grain finding — so the workbook explains how it
-was produced. CSV gives the summary table alone.
+metric, colour-coded by verdict as conditional formatting), an **Examples** sheet
+carrying **ten real key values for every differing column** — with each one's full
+set of rows, the disagreeing cells highlighted, and a distinct-value count — and a
+sheet listing every column that never got a verdict and why. The **Export info**
+manifest records the key column, the columns you selected, whether sample mode was
+on, how deep the examples go, and the duplicate-grain finding — so the workbook
+explains how it was produced. CSV gives the summary table alone, with no examples.
 
 ## Exporting
 
@@ -306,8 +333,8 @@ everything that queries a file.
 | `GET /api/pivot/aggregations` | The aggregations the Values well offers, and the pivot's size limits |
 | `POST /api/pivot` | Build a pivot table (rows, columns, values, filters, sort, toggles) |
 | `POST /api/pivot/export` | Start a background pivot → Excel export job |
-| `GET /api/diff/defaults` | Default excluded columns, verdict list, and recommendations text |
-| `POST /api/diff/start` | Start a difference-analysis run → job id |
+| `GET /api/diff/defaults` | Suggested column set, verdict list, recommendations text, and the example page size |
+| `POST /api/diff/start` | Start a difference-analysis run → job id. `include` is the ticked column set; omit it to analyse every column |
 | `GET /api/diff/status/{job_id}` | Poll progress; includes every column finished so far |
 | `POST /api/diff/cancel/{job_id}` | Cancel a running analysis |
 | `GET /api/diff/results/{job_id}` | The finished run's full summary |

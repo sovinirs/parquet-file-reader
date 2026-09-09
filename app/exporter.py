@@ -53,9 +53,13 @@ DIFF_VERDICT_FORMATS = {
     diffanalysis.ALL_BLANK: "v_blank",
     diffanalysis.ERROR: "v_error",
 }
-# Evidence is a sample, not a dump: enough to check a verdict by eye.
+# Evidence is a sample, not a dump: enough to check a verdict by eye. Ten assets
+# is what the screen shows for the column a reviewer opened, so the workbook
+# carries the same depth for every differing column rather than a thinner one --
+# the export is the artefact that leaves the tool, and being asked "can you send
+# me a few more rows for this column" is the failure it exists to prevent.
 DIFF_EXPORT_EXAMPLE_COLUMNS = 25
-DIFF_EXPORT_EXAMPLE_ASSETS = 3
+DIFF_EXPORT_EXAMPLE_ASSETS = diffanalysis.DEFAULT_EXAMPLE_ASSETS
 
 # Row groups per exported workbook. A pivot bigger than this is split across
 # several files, so this is a file-size choice, not a ceiling on the export --
@@ -546,14 +550,21 @@ class ExportManager:
             book.close()
 
     def _write_diff_examples(self, job, dataset, summary, config, book, f):
-        """A few real assets per differing column, so the verdict is checkable."""
+        """Ten real assets per differing column, so the verdict is checkable."""
         sheet = book.add_worksheet("Examples")
         sheet.set_column(0, 0, 34)
         sheet.set_column(1, 1, 18)
         sheet.set_column(2, 2, 16)
         sheet.set_column(3, 3, 44)
+        sheet.set_column(4, 4, 9)
+        sheet.set_column(5, 5, 11)
+        key_label = (config.as_dict() if hasattr(config, "as_dict")
+                     else dict(config or {})).get("key_column") or "Key"
+        area_label = (config.as_dict() if hasattr(config, "as_dict")
+                      else dict(config or {})).get("explain_column") or "Row"
         for index, title in enumerate(
-                ("Column", "Asset", "Depreciation area", "Value", "Blank?")):
+                ("Column", key_label, area_label, "Value", "Blank?",
+                 "Distinct values")):
             sheet.write(0, index, title, f["head"])
 
         differing = [r["column"] for r in (summary.get("columns") or [])
@@ -569,6 +580,7 @@ class ExportManager:
             except Exception:  # noqa: BLE001 - one column's evidence, not the file
                 continue
             for asset in found.get("assets") or []:
+                distinct = len(asset.get("distinct_values") or [])
                 for row in asset["rows"]:
                     sheet.write(line, 0, column, f["cell"])
                     sheet.write(line, 1, str(asset["asset"]), f["cell"])
@@ -578,11 +590,12 @@ class ExportManager:
                     sheet.write(line, 3, text[:EXCEL_MAX_CELL_CHARS],
                                 f["diff_cell"] if asset["differs"] else f["cell"])
                     sheet.write(line, 4, "yes" if row["blank"] else "", f["cell"])
+                    sheet.write_number(line, 5, distinct, f["cell"])
                     line += 1
         if line == 1:
             sheet.write(1, 0, "No column showed a true difference.", f["cell"])
         else:
-            sheet.autofilter(0, 0, line - 1, 4)
+            sheet.autofilter(0, 0, line - 1, 5)
             sheet.freeze_panes(1, 0)
 
     @staticmethod
@@ -636,8 +649,13 @@ class ExportManager:
             ("Rows analysed", "{:,}".format(summary.get("rows_analysed") or 0)),
             ("Columns analysed", str(summary.get("columns_analysed") or 0)),
             ("Columns excluded", str(summary.get("columns_excluded") or 0)),
+            ("Columns selected", ", ".join(spec.get("include"))
+                                 if spec.get("include") is not None
+                                 else "every column in the file"),
             ("Exclusions", ", ".join(spec.get("exclude") or []) or "none"),
             ("Blank columns excluded", "yes" if spec.get("exclude_all_blank") else "no"),
+            ("Examples per differing column",
+             "{} assets, with every one of their rows".format(DIFF_EXPORT_EXAMPLE_ASSETS)),
             ("Duplicate grain check", grain_text),
         ]
         for verdict, count in (summary.get("verdict_counts") or {}).items():
