@@ -25,7 +25,7 @@ import xlsxwriter
 from . import diffanalysis
 from . import pivot as pivot_module
 from .engine import Engine, categorise
-from .filters import describe
+from .filters import describe, format_label
 
 # Excel's hard ceiling is 1,048,576 rows per sheet; one goes to the header.
 EXCEL_MAX_DATA_ROWS = 1_048_575
@@ -66,6 +66,12 @@ DIFF_EXPORT_EXAMPLE_ASSETS = diffanalysis.DEFAULT_EXAMPLE_ASSETS
 # and it is kept in step with what the pivot can hold at once, so that each file
 # is built whole rather than windowed.
 PIVOT_EXPORT_MAX_ROWS = pivot_module.HARD_MAX_ROW_KEYS
+
+
+def _describe_transform(name: str, value: Any) -> str:
+    part, date_format = Engine._transform_of(value)
+    text = "{} → {} only".format(name, part)
+    return text + " (read as {})".format(format_label(date_format)) if date_format else text
 
 
 @dataclass
@@ -446,8 +452,8 @@ class ExportManager:
             ("Rows exported", "{:,}".format(job.total) if job.total is not None else "unknown"),
             ("Columns exported", ", ".join(columns) if columns else "all ({})".format(len(dataset.columns))),
             ("Sort", "{} {}".format(order_by, "desc" if descending else "asc") if order_by else "none"),
-            ("Extracted", ", ".join("{} → {} only".format(name, part)
-                                    for name, part in sorted((transforms or {}).items())
+            ("Extracted", ", ".join(_describe_transform(name, value)
+                                    for name, value in sorted((transforms or {}).items())
                                     if not columns or name in columns) or "none"),
         ]
         line = 2

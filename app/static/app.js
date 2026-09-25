@@ -18,6 +18,7 @@ const state = {
   mode: 'data',         // 'data' (row grid) | 'pivot' (cross-tab)
   filters: {},          // column name -> filter spec
   transforms: {},       // column name -> 'year' | 'month' | 'day' extracted in the grid + export
+  dateFormats: {},      // column name -> how a text column's dates are read (see DATE_FORMATS on the server)
   hidden: new Set(),    // columns excluded from preview + export
   sort: null,           // { column, descending }
   pageSize: 10,
@@ -150,25 +151,53 @@ const activeFilters = () => Object.values(state.filters);
 
 const EXTRACT_PARTS = [['year', 'Year'], ['month', 'Month'], ['day', 'Day']];
 
+const isRealDate = (column) => column.category === 'temporal' && /^(DATE|TIMESTAMP)/i.test(column.type);
+// Text (or YYYYMMDD integer) columns the server found dates in when the file opened.
+const isTextDate = (column) => !isRealDate(column) && Boolean(column.date_formats && column.date_formats.length);
 // Only calendar values have a year, month and day -- not TIME or INTERVAL.
-const canExtract = (column) => column.category === 'temporal' && /^(DATE|TIMESTAMP)/i.test(column.type);
+const canExtract = (column) => isRealDate(column) || isTextDate(column);
 
 const rawColumn = (name) => state.dataset.columns.find((c) => c.name === name);
+
+const dateFormatOf = (column) => state.dateFormats[column.name] || column.date_formats[0];
+
+// '%d/%m/%Y' -> 'DD/MM/YYYY'; mirrors format_label() on the server.
+function formatLabel(format) {
+  if (format === 'iso') return 'YYYY-MM-DD';
+  return [['%Y', 'YYYY'], ['%y', 'YY'], ['%m', 'MM'], ['%d', 'DD'], ['%H', 'hh'], ['%M', 'mm'],
+    ['%S', 'ss'], ['%B', 'Month'], ['%b', 'Mon']]
+    .reduce((text, [token, label]) => text.split(token).join(label), format);
+}
 
 /* The column as the Data view presents it: an extracted date column is a plain
    integer column (2023, 2024…), so its filter panel offers number tools. */
 function effectiveColumn(column) {
   const raw = rawColumn(column.name) || column;
   const part = state.transforms[raw.name];
-  return part ? { ...raw, type: 'BIGINT', category: 'numeric', transform: part, rawType: raw.type } : raw;
+  if (!part) return raw;
+  return {
+    ...raw, type: 'BIGINT', category: 'numeric', transform: part, rawType: raw.type,
+    dateFormat: isTextDate(raw) ? dateFormatOf(raw) : null,
+  };
+}
+
+// What the server needs to extract: a bare part for a real date column, the
+// part plus how to read it for a text one.
+function transformsPayload() {
+  const out = {};
+  for (const [name, part] of Object.entries(state.transforms)) {
+    const raw = rawColumn(name);
+    out[name] = raw && isTextDate(raw) ? { part, format: dateFormatOf(raw) } : part;
+  }
+  return out;
 }
 
 function typeLabel(name, fallback) {
   const part = state.transforms[name];
   const raw = rawColumn(name);
-  return part && raw ? `${part} of ${raw.type}` : fallback;
+  if (!part || !raw) return fallback;
+  return isTextDate(raw) ? `${part} of ${raw.type} (${formatLabel(dateFormatOf(raw))})` : `${part} of ${raw.type}`;
 }
-
 function setExtract(name, part) {
   const previous = state.transforms[name] || null;
   part = part || null;
@@ -192,6 +221,28 @@ function setExtract(name, part) {
   if (pop.column && pop.column.name === name) openFilterPopover(rawColumn(name), pop.anchor);
 }
 
+function setDateFormat(name, format) {
+  const raw = rawColumn(name);
+  if (!raw || dateFormatOf(raw) === format) return;
+  state.dateFormats[name] = format;
+  // A filter on the extracted part read 03/04 one way; the other way it
+  // picks different rows, so it goes.
+  const spec = state.filters[name];
+  const dropped = Boolean(spec && spec.date_format && spec.date_format !== format);
+  if (dropped) {
+    delete state.filters[name];
+    toast(`Cleared the filter on ${name} — it read the dates as ${formatLabel(spec.date_format)}.`);
+  }
+  if (state.transforms[name] || dropped) {
+    state.page = 0;
+    renderChips();
+    renderRail();
+    refresh({ countUnchanged: !dropped });
+    renderExportSummary();
+  }
+  if (pop.column && pop.column.name === name) openFilterPopover(raw, pop.anchor);
+}
+
 function renderExtractBar(column) {
   const bar = $('pop-extract');
   bar.innerHTML = '';
@@ -211,6 +262,29 @@ function renderExtractBar(column) {
     group.appendChild(button);
   }
   bar.appendChild(group);
+
+  if (isTextDate(raw)) {
+    // The dates are text, so say how they are being read -- and when the
+    // sample fits more than one layout (no day above 12), let the user pick.
+    const line = el('div', 'pop-extract-format');
+    line.appendChild(el('span', null, `Dates stored as ${raw.type.toLowerCase()}, read as `));
+    const current = dateFormatOf(raw);
+    if (raw.date_formats.length > 1) {
+      const select = el('select', 'input small');
+      for (const format of raw.date_formats) {
+        const option = el('option', null, formatLabel(format));
+        option.value = format;
+        select.appendChild(option);
+      }
+      select.value = current;
+      select.onchange = () => setDateFormat(raw.name, select.value);
+      line.appendChild(select);
+      line.title = 'Every sampled date fits more than one layout. Pick the one this file uses.';
+    } else {
+      line.appendChild(el('b', null, formatLabel(current)));
+    }
+    bar.appendChild(line);
+  }
 }
 const visibleColumns = () =>
   state.dataset.columns.filter((c) => !state.hidden.has(c.name)).map((c) => c.name);
@@ -329,6 +403,7 @@ function mountDataset(dataset) {
   state.dataset = dataset;
   state.filters = {};
   state.transforms = {};
+  state.dateFormats = {};
   state.hidden = new Set();
   state.sort = null;
   state.page = 0;
@@ -438,8 +513,11 @@ function renderRail() {
     else if (isExplain) nameRow.appendChild(el('span', 'role-tag explains', 'EXPLAINS'));
     body.appendChild(nameRow);
     // Extraction is a Data view setting; Pivot and Difference read raw values.
-    const shownType = state.mode === 'data' ? typeLabel(column.name, column.type) : column.type;
-    body.appendChild(el('div', `col-type${shownType !== column.type ? ' extracted' : ''}`, shownType));
+    let shownType = state.mode === 'data' ? typeLabel(column.name, column.type) : column.type;
+    // Point out the text columns that hold dates, since that is not obvious.
+    if (state.mode === 'data' && shownType === column.type && isTextDate(column)) shownType += ' · dates';
+    const extractedHere = state.mode === 'data' && Boolean(state.transforms[column.name]);
+    body.appendChild(el('div', `col-type${extractedHere ? ' extracted' : ''}`, shownType));
     body.title = `${column.name} · ${shownType}`;
 
     const actions = el('div', 'col-actions');
@@ -597,7 +675,7 @@ async function refresh({ countUnchanged = false } = {}) {
       offset: state.page * state.pageSize,
       order_by: state.sort ? state.sort.column : null,
       descending: state.sort ? state.sort.descending : false,
-      transforms: state.transforms,
+      transforms: transformsPayload(),
     });
     if (token !== state.reqToken) return;
     state.lastMs = performance.now() - started;
@@ -642,6 +720,7 @@ function renderGrid(data) {
     label.onclick = () => cycleSort(column.name);
 
     const filterBtn = el('button', `th-filter${isFiltered ? ' active' : ''}`, '▼');
+    filterBtn.dataset.column = column.name;
     filterBtn.title = isFiltered ? 'Edit filter' : 'Filter this column';
     filterBtn.onclick = (event) => {
       event.stopPropagation();
@@ -692,6 +771,7 @@ function renderGrid(data) {
     tr.appendChild(cell);
     body.appendChild(tr);
   }
+  if (!$('popover').hidden && pop.column) positionPopover(pop.anchor);
 }
 
 function cycleSort(column) {
@@ -810,11 +890,18 @@ function openFilterPopover(column, anchor) {
 }
 
 function positionPopover(anchor) {
-  // The grid re-renders under an open popover (e.g. after an extraction);
-  // a detached anchor has no position, so stay where we are.
+  // The grid re-renders under an open popover (e.g. after an extraction),
+  // replacing the header button it hangs from: follow the new one.
+  if (anchor && !anchor.isConnected && pop.column) {
+    const fresh = [...document.querySelectorAll('#grid-head .th-filter')]
+      .find((button) => button.dataset.column === pop.column.name);
+    if (fresh) pop.anchor = anchor = fresh;
+  }
   if (!anchor || !anchor.isConnected) return;
   const node = $('popover');
   const box = anchor.getBoundingClientRect();
+  // Nothing to measure (hidden or mid-render): stay where we are.
+  if (!box.width && !box.height) return;
   const width = node.offsetWidth || 340;
   let left = Math.min(box.left, window.innerWidth - width - 12);
   left = Math.max(12, left);
@@ -944,6 +1031,7 @@ async function loadValues(search = '', listNode = null, exact = null) {
       search,
       exact,
       transform: column.transform || null,
+      date_format: column.dateFormat || null,
       limit: exact ? Math.max(300, exact.length) : 300,
     });
     if (!pop.column || pop.column.name !== column.name || pop.pasted !== pasted) return;
@@ -1085,6 +1173,7 @@ async function loadStats() {
       column: column.name,
       filters: activeFilters(),
       transform: column.transform || null,
+      date_format: column.dateFormat || null,
     });
     if (!pop.column || pop.column.name !== column.name) return null;
     pop.stats = data;
@@ -1267,6 +1356,8 @@ function applyFilter() {
   // it is read -- the Pivot and Difference tabs included.
   if (column.transform) draft.transform = column.transform;
   else delete draft.transform;
+  if (column.transform && column.dateFormat) draft.date_format = column.dateFormat;
+  else delete draft.date_format;
 
   if (pop.tab === 'values') {
     draft.op = draft.op === 'not_in' ? 'not_in' : 'in';
@@ -1592,7 +1683,7 @@ async function startExport() {
     include_manifest: $('export-manifest').checked,
     sheet_name: $('export-sheet').value.trim() || 'Data',
     total_hint: state.matched,
-    transforms: state.transforms,
+    transforms: transformsPayload(),
   };
 
   $('btn-start-export').disabled = true;

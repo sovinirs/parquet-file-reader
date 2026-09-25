@@ -33,6 +33,22 @@ NULL_TOKEN = "__PQS_NULL__"
 TRANSFORMS = ("year", "month", "day")
 TRANSFORM_TYPE = "BIGINT"
 
+# Formats a text (or YYYYMMDD integer) column can hold dates in, tried in this
+# order when a file is opened. "iso" is DuckDB's own cast, which reads
+# 2024-01-31, 2024/01/31 and 2024-01-31 10:11:12(.5). Day-first comes before
+# month-first, so when a sample fits both (no day above 12) day-first is the
+# default -- the UI lets the user switch. Only formats in this list are ever
+# put into SQL.
+DATE_FORMATS = (
+    "iso",
+    "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%m-%d-%Y", "%d.%m.%Y",
+    "%d/%m/%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%m/%d/%Y %H:%M",
+    "%d-%m-%Y %H:%M:%S", "%d.%m.%Y %H:%M:%S",
+    "%Y%m%d", "%Y%m%d%H%M%S",
+    "%d-%b-%Y", "%d %b %Y", "%d-%b-%y", "%b %d, %Y", "%b %d %Y", "%d %B %Y", "%B %d, %Y",
+    "%d/%m/%y", "%m/%d/%y",
+)
+
 
 class FilterError(ValueError):
     """A filter the user sent cannot be honoured."""
@@ -47,21 +63,49 @@ def can_transform(sql_type: str) -> bool:
     return sql_type.upper().startswith(("DATE", "TIMESTAMP"))
 
 
-def column_sql(column: str, sql_type: str, transform: Optional[str] = None) -> Tuple[str, str]:
+_FORMAT_TOKENS = (("%Y", "YYYY"), ("%y", "YY"), ("%m", "MM"), ("%d", "DD"), ("%H", "hh"),
+                  ("%M", "mm"), ("%S", "ss"), ("%B", "Month"), ("%b", "Mon"))
+
+
+def format_label(date_format: str) -> str:
+    """'%d/%m/%Y' -> 'DD/MM/YYYY', for people rather than strptime."""
+    if date_format == "iso":
+        return "YYYY-MM-DD"
+    for token, label in _FORMAT_TOKENS:
+        date_format = date_format.replace(token, label)
+    return date_format
+
+
+def parse_date_sql(col_sql: str, date_format: str) -> str:
+    """A text/integer column read as a timestamp; values that don't fit become NULL."""
+    if date_format not in DATE_FORMATS:
+        raise FilterError("Unsupported date format: {!r}".format(date_format))
+    text = "trim(CAST({} AS VARCHAR))".format(col_sql)
+    if date_format == "iso":
+        return "TRY_CAST({} AS TIMESTAMP)".format(text)
+    # Safe to inline: it is one of the fixed strings above.
+    return "try_strptime({}, '{}')".format(text, date_format)
+
+
+def column_sql(column: str, sql_type: str, transform: Optional[str] = None,
+               date_format: Optional[str] = None) -> Tuple[str, str]:
     """(SQL expression, SQL type) for a column, with an optional part extracted.
 
     The one place an extraction becomes SQL, so a filter, a value list and an
     exported column all mean exactly the same thing by "year of order_date".
+    A column that stores dates as text needs `date_format` to be read first.
     """
     col = quote_ident(column)
     if not transform:
         return col, sql_type
     if transform not in TRANSFORMS:
         raise FilterError("Unsupported extraction: {!r}".format(transform))
-    if not can_transform(sql_type):
-        raise FilterError("Only date and timestamp columns can have their {} extracted, and {!r} is {}"
-                          .format(transform, column, sql_type))
-    return "{}({})".format(transform, col), TRANSFORM_TYPE
+    if can_transform(sql_type):
+        return "{}({})".format(transform, col), TRANSFORM_TYPE
+    if date_format:
+        return "{}({})".format(transform, parse_date_sql(col, date_format)), TRANSFORM_TYPE
+    raise FilterError("Only date and timestamp columns, or columns holding dates as text, can have "
+                      "their {} extracted, and {!r} is {}".format(transform, column, sql_type))
 
 
 def _is_text_type(sql_type: str) -> bool:
@@ -94,7 +138,7 @@ def build_predicate(spec: Dict[str, Any], sql_type: str) -> Tuple[str, List[Any]
 
     # A filter set on an extracted part ("year of order_date") carries it, so it
     # means the same thing in every view that reads it.
-    col, sql_type = column_sql(column, sql_type, spec.get("transform"))
+    col, sql_type = column_sql(column, sql_type, spec.get("transform"), spec.get("date_format"))
     params: List[Any] = []
 
     if op == "is_null":

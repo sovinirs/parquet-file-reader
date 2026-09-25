@@ -343,6 +343,91 @@ def extract_checks(call, con, src, did):
         check("the export info sheet records the extraction", "order_date → year only" in text, True)
 
 
+def text_date_checks(call, con, src):
+    """Dates stored as text (or YYYYMMDD integers) are spotted and can be extracted."""
+    import tempfile
+    import time
+
+    print("\ndates stored as text")
+    with tempfile.TemporaryDirectory() as scratch:
+        path = os.path.join(scratch, "text_dates.parquet")
+        con.execute("""COPY (SELECT id,
+                strftime(order_date, '%d/%m/%Y') AS ship_text,
+                strftime(order_date, '%Y-%m-%d') AS iso_text,
+                CAST(strftime(order_date, '%Y%m%d') AS INTEGER) AS ymd_int,
+                strftime(order_date, '%d-%b-%Y') AS mon_text,
+                -- every day is 12 or under, so DD/MM and MM/DD both fit
+                strftime(DATE '2024-01-01' + INTERVAL (id % 12) DAY, '%d/%m/%Y') AS ambiguous,
+                CASE WHEN id % 10 = 0 THEN 'N/A' ELSE strftime(order_date, '%d/%m/%Y') END AS with_blanks,
+                CASE WHEN id % 10 = 0 THEN 'soon' ELSE strftime(order_date, '%d/%m/%Y') END AS not_dates,
+                region, quantity
+            FROM {} WHERE id < 200000) TO '{}'""".format(src, path))
+        text = "read_parquet('{}')".format(path)
+        dataset = call("/api/open", {"path": path})
+        did = dataset["id"]
+        found = {c["name"]: c.get("date_formats") for c in dataset["columns"]}
+        check("DD/MM/YYYY text is spotted", found["ship_text"], ["%d/%m/%Y"])
+        check("ISO text is spotted", found["iso_text"], ["iso"])
+        check("YYYYMMDD integers are spotted", found["ymd_int"], ["%Y%m%d"])
+        check("31-Jan-2024 text is spotted", found["mon_text"], ["%d-%b-%Y"])
+        check("a sample that fits both layouts offers both, day-first first",
+              found["ambiguous"], ["%d/%m/%Y", "%m/%d/%Y"])
+        check("N/A placeholders don't hide a date column", found["with_blanks"], ["%d/%m/%Y"])
+        check("a column with real non-dates is left alone", found["not_dates"], None)
+        check("ordinary text and numbers are left alone", (found["region"], found["quantity"]), (None, None))
+
+        shown = call("/api/preview", {"dataset_id": did, "filters": [], "limit": 4, "order_by": "id",
+                                      "columns": ["id", "ship_text", "ymd_int", "mon_text"],
+                                      "transforms": {"ship_text": {"part": "year", "format": "%d/%m/%Y"},
+                                                     "ymd_int": {"part": "month", "format": "%Y%m%d"},
+                                                     "mon_text": {"part": "day", "format": "%d-%b-%Y"}}})
+        check("text dates extract to year, month and day",
+              shown["rows"],
+              [list(r) for r in con.sql("SELECT id, year(order_date), month(order_date), day(order_date) "
+                                        "FROM {} ORDER BY id LIMIT 4".format(src)).fetchall()])
+
+        spec = {"column": "ship_text", "transform": "year", "date_format": "%d/%m/%Y",
+                "op": "in", "values": [2024]}
+        want = con.sql("SELECT count(*) FROM {} WHERE id < 200000 AND year(order_date) = 2024"
+                       .format(src)).fetchone()[0]
+        check("a filter on a text date's year", call("/api/count", {"dataset_id": did, "filters": [spec]})["count"],
+              want)
+        blanks = call("/api/values", {"dataset_id": did, "column": "with_blanks", "filters": [],
+                                      "transform": "month", "date_format": "%d/%m/%Y"})
+        check("placeholders come out blank", blanks["values"][-1]["value"], None)
+
+        # 01/02/2024 is 1 February read day-first, 2 January month-first.
+        day_first = call("/api/values", {"dataset_id": did, "column": "ambiguous", "filters": [],
+                                         "transform": "month", "date_format": "%d/%m/%Y"})
+        month_first = call("/api/values", {"dataset_id": did, "column": "ambiguous", "filters": [],
+                                           "transform": "month", "date_format": "%m/%d/%Y"})
+        check("the chosen layout decides how 01/02 reads",
+              ([v["value"] for v in day_first["values"]], len(month_first["values"])), ([1], 12))
+
+        check("a text column needs a format to extract from",
+              call("/api/preview", {"dataset_id": did, "filters": [],
+                                    "transforms": {"ship_text": "year"}}).get("HTTP_ERROR"), 400)
+        check("only known formats are accepted",
+              call("/api/count", {"dataset_id": did, "filters": [dict(spec, date_format="%d' OR 1=1 --")]})
+              .get("HTTP_ERROR"), 400)
+
+        job = call("/api/export", {"dataset_id": did, "format": "parquet", "filters": [spec],
+                                   "columns": ["id", "ship_text"], "row_limit": 10,
+                                   "transforms": {"ship_text": {"part": "year", "format": "%d/%m/%Y"}}})
+        deadline = time.time() + 60
+        while job.get("status") in ("queued", "counting", "running") and time.time() < deadline:
+            time.sleep(0.2)
+            job = call("/api/export/{}".format(job["id"]))
+        out = os.path.join(scratch, "out.parquet")
+        with urllib.request.urlopen(BASE + "/api/export/{}/download".format(job["id"])) as response, \
+                open(out, "wb") as handle:
+            handle.write(response.read())
+        check("a text date exports as its year, an integer",
+              con.sql("SELECT DISTINCT typeof(ship_text), ship_text FROM read_parquet('{}')".format(out))
+              .fetchall(), [("BIGINT", 2024)])
+        call("/api/dataset/{}".format(did), method="DELETE")
+
+
 def union_checks(call, con, src):
     """Two halves of the sample, unioned back, must behave exactly like the whole."""
     import tempfile
@@ -754,6 +839,7 @@ def main():
         check("{} file is non-empty".format(fmt), job["size"] > 0, True)
 
     extract_checks(call, con, src, did)
+    text_date_checks(call, con, src)
     union_checks(call, con, src)
 
     print("\n{} passed, {} failed".format(passed, failed))

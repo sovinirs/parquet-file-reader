@@ -108,6 +108,19 @@ keeps its name; its type reads e.g. `year of TIMESTAMP`.
   same thing there ("year is 2024").
 - The Excel export's *Export info* sheet lists which columns were extracted.
 
+**Dates stored as text.** When a file opens, the first 2,000 rows of every text
+column (and every integer column, for `20240131`-style values) are checked
+against common date layouts: `2024-01-31`, `31/01/2024`, `01/31/2024`,
+`31-01-2024`, `31.01.2024`, `20240131`, `31-Jan-2024`, `Jan 31, 2024` and their
+date-time variants. A column where every sampled value fits one gets the same
+**Extract** row, and reads `VARCHAR · dates` in the Columns rail.
+
+- The panel says how the dates are being read, e.g. *read as DD/MM/YYYY*. When
+  every sampled date fits both day-first and month-first (no day above 12), you
+  choose which one from a dropdown; day-first is the default.
+- `N/A`, `NULL`, `-` and blanks don't stop a column from being recognised. They,
+  and any later value that doesn't fit the layout, extract as blank.
+
 Filters on different columns are **ANDed together**, exactly like Excel's
 autofilter. Two details that follow from that:
 

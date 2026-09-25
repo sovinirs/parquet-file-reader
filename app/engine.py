@@ -15,7 +15,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import duckdb
 
-from .filters import FilterError, build_where, column_sql, quote_ident
+from .filters import DATE_FORMATS, FilterError, build_where, column_sql, parse_date_sql, quote_ident
 
 NUMERIC_PREFIXES = (
     "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT",
@@ -23,6 +23,17 @@ NUMERIC_PREFIXES = (
 )
 TEMPORAL_PREFIXES = ("DATE", "TIME", "TIMESTAMP", "INTERVAL")
 TEXT_PREFIXES = ("VARCHAR", "CHAR", "TEXT", "STRING", "UUID", "ENUM", "BLOB", "BIT")
+
+# Checking for dates stored as text reads this many rows from the top of the
+# file -- a row group or two, so opening stays instant however big the file is.
+DATE_SAMPLE_ROWS = 2000
+# Where dates hide in the wrong type: strings, and integers like 20240131.
+DATE_TEXT_TYPES = ("VARCHAR", "CHAR", "TEXT", "STRING")
+DATE_INT_TYPES = ("INTEGER", "BIGINT", "UINTEGER", "UBIGINT", "HUGEINT")
+DATE_INT_FORMATS = ("%Y%m%d", "%Y%m%d%H%M%S")
+# Placeholders that mean "no date" in exported data. They don't count against a
+# format (extracting from them gives a blank, like any value that doesn't parse).
+DATE_BLANKS = ("null", "none", "n/a", "na", "nan", "nat", "-", "--")
 
 
 def categorise(sql_type: str) -> str:
@@ -69,9 +80,15 @@ class Column:
     name: str
     sql_type: str
     category: str
+    # Set when a non-date column turned out to hold dates: every format that
+    # read the whole sample, best guess first.
+    date_formats: List[str] = field(default_factory=list)
 
     def as_dict(self) -> Dict[str, Any]:
-        return {"name": self.name, "type": self.sql_type, "category": self.category}
+        out = {"name": self.name, "type": self.sql_type, "category": self.category}
+        if self.date_formats:
+            out["date_formats"] = list(self.date_formats)
+        return out
 
 
 @dataclass
@@ -167,6 +184,7 @@ class Engine:
             raise ValueError("Could not read parquet: {}".format(exc))
 
         columns = [Column(name=row[0], sql_type=row[1], category=categorise(row[1])) for row in described]
+        self._detect_dates(cur, source, columns)
         if not columns:
             raise ValueError("That parquet file has no columns.")
 
@@ -242,6 +260,7 @@ class Engine:
                              + " ".join(problems))
 
         columns = [Column(name=n, sql_type=t, category=categorise(t)) for n, t in schemas[0]]
+        self._detect_dates(cur, sources, columns)
         tag = None
         if source_column:
             taken = {c.name for c in columns}
@@ -273,6 +292,53 @@ class Engine:
         self.datasets[dataset.id] = dataset
         return dataset
 
+    @staticmethod
+    def _detect_dates(cur, source: Any, columns: List[Column]) -> None:
+        """Spot text (and YYYYMMDD integer) columns that really hold dates.
+
+        One query over the first DATE_SAMPLE_ROWS rows counts, per column and
+        format, the non-blank values that fail to parse. A format that reads
+        every one of them is a match. Nothing is decided on a column with no
+        values in the sample.
+        """
+        checks = []
+        for column in columns:
+            upper = column.sql_type.upper()
+            if upper.startswith(DATE_TEXT_TYPES):
+                formats = DATE_FORMATS
+            elif upper.startswith(DATE_INT_TYPES):
+                formats = DATE_INT_FORMATS
+            else:
+                continue
+            checks.append((column, formats))
+        if not checks:
+            return
+
+        parts, index = [], 0
+        for position, (column, formats) in enumerate(checks):
+            col = 's.c{}'.format(position)
+            present = "lower(trim(CAST({} AS VARCHAR))) NOT IN ('', {})".format(
+                col, ", ".join("'{}'".format(b) for b in DATE_BLANKS))
+            parts.append("count(*) FILTER (WHERE {})".format(present))
+            for fmt in formats:
+                parts.append("count(*) FILTER (WHERE {} AND {} IS NULL)".format(
+                    present, parse_date_sql(col, fmt)))
+        sample = ", ".join("{} AS c{}".format(quote_ident(column.name), position)
+                           for position, (column, _) in enumerate(checks))
+        sql = "SELECT {} FROM (SELECT {} FROM read_parquet(?, union_by_name=true) LIMIT {}) AS s".format(
+            ", ".join(parts), sample, DATE_SAMPLE_ROWS)
+        try:
+            counts = cur.execute(sql, [source]).fetchone()
+        except duckdb.Error:
+            return  # a best-effort hint, never a reason to refuse the file
+
+        for column, formats in checks:
+            present = counts[index]
+            failures = counts[index + 1:index + 1 + len(formats)]
+            index += 1 + len(formats)
+            if present:
+                column.date_formats = [fmt for fmt, bad in zip(formats, failures) if bad == 0]
+
     def get(self, dataset_id: str) -> Dataset:
         dataset = self.datasets.get(dataset_id)
         if dataset is None:
@@ -302,6 +368,14 @@ class Engine:
                         tag, quote_ident(dataset.source_column))
         return "read_parquet(?, union_by_name=true)"
 
+    @staticmethod
+    def _transform_of(value: Any) -> Tuple[Optional[str], Optional[str]]:
+        """A transforms entry as (part, date format). "year" is shorthand for a
+        real date column; a text date column sends {"part", "format"}."""
+        if isinstance(value, dict):
+            return value.get("part") or None, value.get("format") or None
+        return value or None, None
+
     def _select_list(
         self,
         dataset: Dataset,
@@ -321,8 +395,9 @@ class Engine:
             chosen = list(dataset.columns)
         parts, shaped = [], []
         for column in chosen:
-            if transforms.get(column.name):
-                expr, sql_type = column_sql(column.name, column.sql_type, transforms[column.name])
+            part, date_format = self._transform_of(transforms.get(column.name))
+            if part:
+                expr, sql_type = column_sql(column.name, column.sql_type, part, date_format)
                 parts.append("{} AS {}".format(expr, quote_ident(column.name)))
                 shaped.append(Column(name=column.name, sql_type=sql_type, category=categorise(sql_type)))
             else:
@@ -346,7 +421,7 @@ class Engine:
             # Spelled out rather than by name: an extracted column's alias
             # shadows the raw one, and the sort should follow what is shown.
             key, _ = column_sql(order_by, dataset.column_types[order_by],
-                                (transforms or {}).get(order_by))
+                                *self._transform_of((transforms or {}).get(order_by)))
             sql += " ORDER BY {} {} NULLS LAST".format(key, "DESC" if descending else "ASC")
         return sql, [dataset.path] + params, chosen
 
@@ -385,6 +460,7 @@ class Engine:
         limit: int = 500,
         exact: Optional[Sequence[str]] = None,
         transform: Optional[str] = None,
+        date_format: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Value list for a filter panel, honouring every *other* column's filter.
 
@@ -395,7 +471,7 @@ class Engine:
         types = dataset.column_types
         if column not in types:
             raise FilterError("Unknown column: {!r}".format(column))
-        col, sql_type = column_sql(column, types[column], transform)
+        col, sql_type = column_sql(column, types[column], transform, date_format)
         expr = col if categorise(sql_type) != "complex" else "CAST({} AS VARCHAR)".format(col)
 
         where, params = build_where(filters, types, skip_column=column)
@@ -430,11 +506,12 @@ class Engine:
     def column_stats(
         self, dataset: Dataset, column: str, filters: Sequence[Dict[str, Any]],
         transform: Optional[str] = None,
+        date_format: Optional[str] = None,
     ) -> Dict[str, Any]:
         types = dataset.column_types
         if column not in types:
             raise FilterError("Unknown column: {!r}".format(column))
-        col, sql_type = column_sql(column, types[column], transform)
+        col, sql_type = column_sql(column, types[column], transform, date_format)
         category = categorise(sql_type)
         where, params = build_where(filters, types, skip_column=column)
         params = [dataset.path] + params

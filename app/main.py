@@ -58,8 +58,9 @@ class QueryRequest(BaseModel):
     offset: int = 0
     order_by: Optional[str] = None
     descending: bool = False
-    # column -> part to extract ("year", "month" or "day") in place of the value.
-    transforms: Dict[str, str] = Field(default_factory=dict)
+    # column -> part to extract ("year", "month" or "day") in place of the value,
+    # or {"part": ..., "format": ...} for a column holding dates as text.
+    transforms: Dict[str, Any] = Field(default_factory=dict)
 
 
 class CountRequest(BaseModel):
@@ -77,6 +78,8 @@ class ValuesRequest(BaseModel):
     exact: Optional[List[str]] = None
     # List an extracted part of the column (e.g. its years) instead.
     transform: Optional[str] = None
+    # How to read a column that holds dates as text (one of DATE_FORMATS).
+    date_format: Optional[str] = None
 
 
 class StatsRequest(BaseModel):
@@ -84,6 +87,7 @@ class StatsRequest(BaseModel):
     column: str
     filters: List[Dict[str, Any]] = Field(default_factory=list)
     transform: Optional[str] = None
+    date_format: Optional[str] = None
 
 
 class PivotValue(BaseModel):
@@ -146,7 +150,7 @@ class ExportRequest(BaseModel):
     sheet_name: str = "Data"
     total_hint: Optional[int] = None
     # column -> part to extract; the export writes that part in the column.
-    transforms: Dict[str, str] = Field(default_factory=dict)
+    transforms: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ------------------------------------------------------------------- recents
@@ -436,14 +440,15 @@ def values(request: ValuesRequest) -> Dict[str, Any]:
     return _guard(
         engine.distinct_values, dataset, request.column, request.filters,
         request.search, max(1, min(int(request.limit), 2000)), request.exact,
-        request.transform,
+        request.transform, request.date_format,
     )
 
 
 @app.post("/api/stats")
 def stats(request: StatsRequest) -> Dict[str, Any]:
     dataset = _guard(engine.get, request.dataset_id)
-    return _guard(engine.column_stats, dataset, request.column, request.filters, request.transform)
+    return _guard(engine.column_stats, dataset, request.column, request.filters, request.transform,
+                  request.date_format)
 
 
 @app.get("/api/pivot/aggregations")
