@@ -604,6 +604,7 @@ const pop = {
   stats: null,
   anchor: null,
   search: '',
+  pasted: null,          // { wanted, missing } after a list is pasted into search
 };
 
 function tabsFor(category) {
@@ -624,6 +625,7 @@ function openFilterPopover(column, anchor) {
   pop.selected = new Set();
   pop.stats = null;
   pop.search = '';
+  pop.pasted = null;
 
   const tabs = tabsFor(column.category);
   const existingOp = pop.draft.op;
@@ -697,12 +699,26 @@ function renderValuesTab(body) {
 
   const searchBox = el('input', 'input small');
   searchBox.type = 'search';
-  searchBox.placeholder = 'Search values…';
+  searchBox.placeholder = 'Search, or paste a comma separated list…';
   searchBox.value = pop.search;
-  searchBox.oninput = debounce(() => {
+  const runSearch = () => {
     pop.search = searchBox.value;
-    loadValues(pop.search, list);
-  }, 260);
+    // Several values (a pasted list) are looked up exactly and ticked;
+    // a single one is a substring search as before.
+    const wanted = parseValueList(pop.search);
+    pop.pasted = wanted.length > 1 ? { wanted, missing: [] } : null;
+    loadValues(pop.pasted ? '' : pop.search, list, pop.pasted ? wanted : null);
+  };
+  searchBox.oninput = debounce(runSearch, 260);
+  // A single-line input drops the line breaks from a column pasted out of a
+  // spreadsheet, gluing the values together -- turn them into commas first.
+  searchBox.onpaste = (event) => {
+    const text = event.clipboardData && event.clipboardData.getData('text');
+    if (!text || !/[\r\n\t]/.test(text.trim())) return;
+    event.preventDefault();
+    searchBox.value = parseValueList(text).map(listToken).join(', ');
+    runSearch();
+  };
   body.appendChild(searchBox);
 
   const tools = el('div', 'value-tools');
@@ -737,7 +753,13 @@ function renderValuesTab(body) {
     renderValueRows(list);
   }
 
-  if (pop.truncated) {
+  const pasteNote = el('div', 'value-note paste-note');
+  pasteNote.hidden = true;
+  body.appendChild(pasteNote);
+  pop.renderPasteNote = () => renderPasteNote(pasteNote);
+  pop.renderPasteNote();
+
+  if (pop.truncated && !pop.pasted) {
     body.appendChild(el(
       'div', 'value-note',
       `Showing the ${pop.values.length} most common values. Search above, or use the Condition tab to match a wider set.`
@@ -745,21 +767,48 @@ function renderValuesTab(body) {
   }
 }
 
-async function loadValues(search = '', listNode = null) {
+function renderPasteNote(node) {
+  if (!node.isConnected) return;
+  const pasted = pop.pasted;
+  node.hidden = !pasted;
+  if (!pasted) return;
+  const found = pasted.wanted.length - pasted.missing.length;
+  node.textContent = `Found and ticked ${fmtNum(found)} of ${fmtNum(pasted.wanted.length)} pasted values.`;
+  if (pasted.missing.length) {
+    const shown = pasted.missing.slice(0, 8).join(', ');
+    const extra = pasted.missing.length > 8 ? ` +${pasted.missing.length - 8} more` : '';
+    // The list only offers values the *other* filters still allow.
+    const narrowed = activeFilters().some((spec) => spec.column !== pop.column.name);
+    const label = narrowed ? 'Not found in the rows your other filters keep' : 'Not in this column';
+    node.appendChild(el('div', 'paste-missing', `${label}: ${shown}${extra}`));
+  }
+}
+
+async function loadValues(search = '', listNode = null, exact = null) {
   const column = pop.column;
+  const pasted = pop.pasted;
   try {
     const data = await api('/api/values', {
       dataset_id: state.dataset.id,
       column: column.name,
       filters: activeFilters(),
       search,
-      limit: 300,
+      exact,
+      limit: exact ? Math.max(300, exact.length) : 300,
     });
-    if (!pop.column || pop.column.name !== column.name) return;
+    if (!pop.column || pop.column.name !== column.name || pop.pasted !== pasted) return;
     pop.values = data.values;
     pop.truncated = data.truncated;
-    if (listNode && listNode.isConnected) renderValueRows(listNode);
-    else renderPopBody();
+    if (exact && pasted) {
+      // A pasted list replaces the selection with exactly what it names.
+      pop.selected = new Set(data.values.map((entry) => JSON.stringify(entry.value ?? null)));
+      const hits = new Set(data.values.map((entry) => String(entry.value ?? '').toLowerCase()));
+      pasted.missing = exact.filter((value) => !hits.has(value.toLowerCase()));
+    }
+    if (listNode && listNode.isConnected) {
+      renderValueRows(listNode);
+      if (pop.renderPasteNote) pop.renderPasteNote();
+    } else renderPopBody();
   } catch (error) {
     if (listNode && listNode.isConnected) {
       listNode.innerHTML = '';
@@ -989,6 +1038,21 @@ function renderConditionTab(body) {
     listHint.textContent = n ? `— ${fmtNum(n)} value${n === 1 ? '' : 's'}` : '— comma or line separated';
   };
   listBox.oninput = () => { pop.draft.value = listBox.value; countList(); };
+
+  // Pasting several values into the single-value field means "any of these".
+  input.onpaste = (event) => {
+    const text = event.clipboardData && event.clipboardData.getData('text');
+    if (!text || parseValueList(text).length < 2) return;
+    if (!options.some(([value]) => value === 'in')) return;
+    event.preventDefault();
+    const negative = ['ne', 'not_contains'].includes(select.value);
+    select.value = negative ? 'not_in' : 'in';
+    select.onchange();
+    listBox.value = text.trim();
+    pop.draft.value = listBox.value;
+    countList();
+    listBox.focus();
+  };
   listField.appendChild(listBox);
   body.appendChild(listField);
 

@@ -244,8 +244,13 @@ class Engine:
         filters: Sequence[Dict[str, Any]],
         search: str = "",
         limit: int = 500,
+        exact: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
-        """Value list for a filter panel, honouring every *other* column's filter."""
+        """Value list for a filter panel, honouring every *other* column's filter.
+
+        `exact` is a pasted list: return only values equal to one of them
+        (ignoring case), instead of substring-matching `search`.
+        """
         types = dataset.column_types
         if column not in types:
             raise FilterError("Unknown column: {!r}".format(column))
@@ -255,7 +260,11 @@ class Engine:
 
         where, params = build_where(filters, types, skip_column=column)
         params = [dataset.path] + params
-        if search:
+        if exact:
+            clause = "lower(CAST({} AS VARCHAR)) IN ({})".format(col, ", ".join("lower(?)" for _ in exact))
+            where = "{} AND {}".format(where, clause) if where else "WHERE " + clause
+            params.extend(str(v) for v in exact)
+        elif search:
             clause = "CAST({} AS VARCHAR) ILIKE ? ESCAPE '\\'".format(col)
             needle = "%{}%".format(str(search).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
             where = "{} AND {}".format(where, clause) if where else "WHERE " + clause

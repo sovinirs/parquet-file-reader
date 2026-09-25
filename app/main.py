@@ -65,6 +65,8 @@ class ValuesRequest(BaseModel):
     filters: List[Dict[str, Any]] = Field(default_factory=list)
     search: str = ""
     limit: int = 300
+    # A pasted list: look these values up exactly instead of searching.
+    exact: Optional[List[str]] = None
 
 
 class StatsRequest(BaseModel):
@@ -413,7 +415,7 @@ def values(request: ValuesRequest) -> Dict[str, Any]:
     dataset = _guard(engine.get, request.dataset_id)
     return _guard(
         engine.distinct_values, dataset, request.column, request.filters,
-        request.search, max(1, min(int(request.limit), 2000)),
+        request.search, max(1, min(int(request.limit), 2000)), request.exact,
     )
 
 

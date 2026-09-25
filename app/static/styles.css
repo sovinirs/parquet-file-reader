@@ -1468,3 +1468,5 @@ a.btn { display: inline-flex; align-items: center; justify-content: center; }
   .diff-detail-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .vb-tools .input { width: 140px; }
 }
+.paste-note { color: var(--text-dim); }
+.paste-missing { margin-top: 4px; color: var(--text-faint); overflow-wrap: anywhere; }

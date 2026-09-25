@@ -324,6 +324,15 @@ def main():
                                                {"column": "region", "op": "in", "values": ["north"]}]})
     check("value list respects other filters", len(scoped2["values"]), 4)
 
+    pasted = call("/api/values", {"dataset_id": did, "column": "region", "filters": [],
+                                  "exact": ["NORTH", "east", "atlantis"]})
+    check("a pasted list looks values up exactly, ignoring case",
+          sorted(v["value"] for v in pasted["values"]), ["east", "north"])
+    pasted_num = call("/api/values", {"dataset_id": did, "column": "quantity", "filters": [],
+                                      "exact": ["10", "20"]})
+    check("a pasted list works on a numeric column",
+          sorted(v["value"] for v in pasted_num["values"]), [10, 20])
+
     stats = call("/api/stats", {"dataset_id": did, "column": "amount", "filters": []})
     sql_nulls = con.sql("SELECT count(*) - count(amount) FROM {}".format(src)).fetchone()[0]
     check("stats null count", stats["nulls"], sql_nulls)
