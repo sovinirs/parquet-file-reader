@@ -296,8 +296,8 @@ def count_row_groups(engine, dataset, rows, filters=()) -> int:
         return 1
     where, params = build_where(filters, dataset.column_types)
     keys = ", ".join(quote_ident(f) for f in rows)
-    sql = ("SELECT count(*) FROM (SELECT {keys} FROM read_parquet(?, union_by_name=true) "
-           "{where} GROUP BY {keys})").format(keys=keys, where=where)
+    sql = ("SELECT count(*) FROM (SELECT {keys} FROM {src} "
+           "{where} GROUP BY {keys})").format(src=engine._from(dataset), keys=keys, where=where)
     cur = engine.cursor()
     cur.execute(sql, [dataset.path] + params)
     return int(cur.fetchone()[0])
@@ -314,9 +314,9 @@ def outer_group_sizes(engine, dataset, rows, filters=()) -> List[Tuple[Any, int]
     where, params = build_where(filters, dataset.column_types)
     keys = ", ".join(quote_ident(f) for f in rows)
     outer = quote_ident(rows[0])
-    sql = ("SELECT {outer}, count(*) FROM (SELECT {keys} FROM read_parquet(?, union_by_name=true) "
+    sql = ("SELECT {outer}, count(*) FROM (SELECT {keys} FROM {src} "
            "{where} GROUP BY {keys}) GROUP BY {outer} ORDER BY {outer} NULLS LAST").format(
-               outer=outer, keys=keys, where=where)
+               src=engine._from(dataset), outer=outer, keys=keys, where=where)
     cur = engine.cursor()
     cur.execute(sql, [dataset.path] + params)
     return [(record[0], int(record[1])) for record in cur.fetchall()]
@@ -330,15 +330,15 @@ def overall_totals(engine, dataset, values, filters=()) -> List[Tuple[str, Any]]
     """
     measures = [_measure(spec, dataset.column_types) for spec in values]
     where, params = build_where(filters, dataset.column_types)
-    sql = "SELECT {sel} FROM read_parquet(?, union_by_name=true) {where}".format(
-        sel=", ".join(m.sql for m in measures), where=where)
+    sql = "SELECT {sel} FROM {src} {where}".format(
+        src=engine._from(dataset), sel=", ".join(m.sql for m in measures), where=where)
     cur = engine.cursor()
     cur.execute(sql, [dataset.path] + params)
     record = cur.fetchone() or [None] * len(measures)
     return [(m.label, record[i]) for i, m in enumerate(measures)]
 
 
-def _key_window_sql(rows: List[str], where: str, limit: int) -> str:
+def _key_window_sql(src: str, rows: List[str], where: str, limit: int) -> str:
     """A CTE holding just the first `limit` row keys, in row-label order.
 
     Blanks sort last in the grid, so they sort last here too -- the window has to
@@ -346,9 +346,9 @@ def _key_window_sql(rows: List[str], where: str, limit: int) -> str:
     """
     keys = ", ".join(quote_ident(f) for f in rows)
     order = ", ".join("{} NULLS LAST".format(quote_ident(f)) for f in rows)
-    return ("WITH __keys AS (SELECT {keys} FROM read_parquet(?, union_by_name=true) {where} "
+    return ("WITH __keys AS (SELECT {keys} FROM {src} {where} "
             "GROUP BY {keys} ORDER BY {order} LIMIT {limit})").format(
-                keys=keys, where=where, order=order, limit=int(limit))
+                src=src, keys=keys, where=where, order=order, limit=int(limit))
 
 
 def _run_query(engine, dataset, rows, columns, measures, filters, subtotals, max_columns,
@@ -367,9 +367,9 @@ def _run_query(engine, dataset, rows, columns, measures, filters, subtotals, max
     )
     where, params = build_where(filters, dataset.column_types)
     if key_limit is None:
-        sql = ("SELECT {sel} FROM read_parquet(?, union_by_name=true) {where} "
+        sql = ("SELECT {sel} FROM {src} {where} "
                "GROUP BY GROUPING SETS ({sets})").format(
-                   sel=", ".join(select_parts), where=where, sets=rendered)
+                   src=engine._from(dataset), sel=", ".join(select_parts), where=where, sets=rendered)
         args = [dataset.path] + params
     else:
         # Too big to hold whole: narrow the scan to the row keys that will be
@@ -378,9 +378,10 @@ def _run_query(engine, dataset, rows, columns, measures, filters, subtotals, max
         # values rather than by equality.
         on = " AND ".join("__t.{c} IS NOT DISTINCT FROM __keys.{c}".format(c=quote_ident(f))
                           for f in rows)
-        sql = ("{cte} SELECT {sel} FROM read_parquet(?, union_by_name=true) AS __t "
+        sql = ("{cte} SELECT {sel} FROM {src} AS __t "
                "SEMI JOIN __keys ON {on} {where} GROUP BY GROUPING SETS ({sets})").format(
-                   cte=_key_window_sql(rows, where, key_limit), sel=", ".join(select_parts),
+                   cte=_key_window_sql(engine._from(dataset), rows, where, key_limit),
+                   src=engine._from(dataset), sel=", ".join(select_parts),
                    on=on, where=where, sets=rendered)
         args = [dataset.path] + params + [dataset.path] + params
 
@@ -468,9 +469,9 @@ def _grand_totals(engine, dataset, columns, measures, filters):
                      for i, m in enumerate(measures)]
     sets = "({}), ()".format(", ".join(quote_ident(f) for f in columns)) if columns else "()"
     where, params = build_where(filters, dataset.column_types)
-    sql = ("SELECT {sel} FROM read_parquet(?, union_by_name=true) {where} "
+    sql = ("SELECT {sel} FROM {src} {where} "
            "GROUP BY GROUPING SETS ({sets})").format(
-               sel=", ".join(select_parts), where=where, sets=sets)
+               src=engine._from(dataset), sel=", ".join(select_parts), where=where, sets=sets)
 
     cur = engine.cursor()
     cur.execute(sql, [dataset.path] + params)

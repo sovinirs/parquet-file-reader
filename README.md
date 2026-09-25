@@ -66,6 +66,21 @@ file onto the window (which copies it to a temp folder first), use **Browse…**
 pick from Recent. Pointing at a *folder* opens every `.parquet` under it as one
 dataset, so partitioned exports work.
 
+### Unioning several files
+
+**Union several files with the same columns…** under the path box stacks two or
+more files into one table. Give each file its own row (type a path or use its
+**Browse…**, and **+ Add another file** for more), then **Union and open**. The
+result behaves exactly like a single file: filtering, pivoting, difference
+analysis and every export format all work across it.
+
+- Every file needs the same column names with the same types. Columns are matched
+  by name, so their order may differ. If the files don't match, the panel says
+  which file and which columns are the problem.
+- Leave **Add a `source_file` column** ticked to tag each row with the name of the
+  file it came from, so you can filter, pivot or export by file.
+- A folder of parquet parts counts as one file in the list.
+
 ## Filtering
 
 Click any column — in the left rail or via the ▾ on its grid header — to open its
@@ -73,9 +88,25 @@ filter panel. What you get depends on the column's type:
 
 | Tab | Available for | What it does |
 | --- | --- | --- |
-| **Values** | text, boolean, numbers, dates | Checklist of distinct values with row counts. Search to narrow, `All`/`None` to bulk-select, and switch between *Include selected* and *Exclude selected*. |
+| **Values** | text, boolean, numbers, dates | Checklist of distinct values with row counts. Search to narrow, `All`/`None` to bulk-select, and switch between *Include selected* and *Exclude selected*. Paste a comma separated list (or a column copied from a spreadsheet) into the search box to tick exactly those values; any it can't find are listed. |
 | **Range** | numbers, dates/timestamps | Min/max bounds, with the column's real min/max/avg/median shown above and a *Fill from data* shortcut. Tick *Exclude this range* to invert it. |
-| **Condition** | everything | `contains`, `starts with`, `equals`, `>`, `≥`, `matches regex`, `is blank`, and so on. Text matching is case-insensitive unless you tick *Match case*. |
+| **Condition** | everything | `contains`, `starts with`, `equals`, `>`, `≥`, `matches regex`, `is blank`, and so on. `is any of (list)` / `is none of (list)` take values separated by commas or new lines; pasting a list into the value box switches to them. Text matching is case-insensitive unless you tick *Match case*. |
+
+### Extracting the year, month or day
+
+A date or timestamp column's filter panel has an **Extract** row: *Full value*,
+*Year*, *Month* or *Day*. Pick one and that column holds just that part, as a
+whole number (month is 1–12), in the grid **and in every export**. The column
+keeps its name; its type reads e.g. `year of TIMESTAMP`.
+
+- The column's filter then works on the extracted numbers: the Values list shows
+  the years (in calendar order), Range takes e.g. months 3 to 5, and a pasted list
+  like `2023, 2024` works too. A filter set on the full date is cleared when you
+  switch, since it no longer applies.
+- Extraction is a Data view setting. The Pivot and Difference tabs group and
+  compare the raw values, but a filter set on an extracted part still means the
+  same thing there ("year is 2024").
+- The Excel export's *Export info* sheet lists which columns were extracted.
 
 Filters on different columns are **ANDed together**, exactly like Excel's
 autofilter. Two details that follow from that:

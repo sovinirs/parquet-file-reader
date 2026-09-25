@@ -6,7 +6,7 @@ parameters -- only identifiers are interpolated, and those are validated
 against the file's real schema before they get here.
 """
 
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Ops that read a list of discrete values
 SET_OPS = {"in", "not_in"}
@@ -28,12 +28,40 @@ _COMPARATORS = {"eq": "=", "ne": "<>", "gt": ">", "gte": ">=", "lt": "<", "lte":
 NULL_TOKEN = "__PQS_NULL__"
 
 
+# Parts that can be pulled out of a date/timestamp column in place of the full
+# value. Each is a DuckDB function of the same name returning an integer.
+TRANSFORMS = ("year", "month", "day")
+TRANSFORM_TYPE = "BIGINT"
+
+
 class FilterError(ValueError):
     """A filter the user sent cannot be honoured."""
 
 
 def quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
+
+
+def can_transform(sql_type: str) -> bool:
+    """Only calendar values have a year, month and day (TIME and INTERVAL don't)."""
+    return sql_type.upper().startswith(("DATE", "TIMESTAMP"))
+
+
+def column_sql(column: str, sql_type: str, transform: Optional[str] = None) -> Tuple[str, str]:
+    """(SQL expression, SQL type) for a column, with an optional part extracted.
+
+    The one place an extraction becomes SQL, so a filter, a value list and an
+    exported column all mean exactly the same thing by "year of order_date".
+    """
+    col = quote_ident(column)
+    if not transform:
+        return col, sql_type
+    if transform not in TRANSFORMS:
+        raise FilterError("Unsupported extraction: {!r}".format(transform))
+    if not can_transform(sql_type):
+        raise FilterError("Only date and timestamp columns can have their {} extracted, and {!r} is {}"
+                          .format(transform, column, sql_type))
+    return "{}({})".format(transform, col), TRANSFORM_TYPE
 
 
 def _is_text_type(sql_type: str) -> bool:
@@ -64,7 +92,9 @@ def build_predicate(spec: Dict[str, Any], sql_type: str) -> Tuple[str, List[Any]
     if op not in ALL_OPS:
         raise FilterError("Unsupported filter operator: {!r}".format(op))
 
-    col = quote_ident(column)
+    # A filter set on an extracted part ("year of order_date") carries it, so it
+    # means the same thing in every view that reads it.
+    col, sql_type = column_sql(column, sql_type, spec.get("transform"))
     params: List[Any] = []
 
     if op == "is_null":
@@ -186,6 +216,8 @@ def describe(spec: Dict[str, Any]) -> str:
     """Human-readable summary, used for the export manifest sheet."""
     op = (spec.get("op") or "in").lower()
     col = spec.get("column")
+    if spec.get("transform"):
+        col = "{} ({})".format(col, spec["transform"])
     if op in NULLARY_OPS:
         return "{} {}".format(col, op.replace("_", " "))
     if op in SET_OPS:

@@ -44,6 +44,12 @@ class OpenRequest(BaseModel):
     path: str
 
 
+class UnionRequest(BaseModel):
+    paths: List[str]
+    # Add a column naming the file each row came from.
+    source_column: bool = True
+
+
 class QueryRequest(BaseModel):
     dataset_id: str
     filters: List[Dict[str, Any]] = Field(default_factory=list)
@@ -52,6 +58,8 @@ class QueryRequest(BaseModel):
     offset: int = 0
     order_by: Optional[str] = None
     descending: bool = False
+    # column -> part to extract ("year", "month" or "day") in place of the value.
+    transforms: Dict[str, str] = Field(default_factory=dict)
 
 
 class CountRequest(BaseModel):
@@ -67,12 +75,15 @@ class ValuesRequest(BaseModel):
     limit: int = 300
     # A pasted list: look these values up exactly instead of searching.
     exact: Optional[List[str]] = None
+    # List an extracted part of the column (e.g. its years) instead.
+    transform: Optional[str] = None
 
 
 class StatsRequest(BaseModel):
     dataset_id: str
     column: str
     filters: List[Dict[str, Any]] = Field(default_factory=list)
+    transform: Optional[str] = None
 
 
 class PivotValue(BaseModel):
@@ -134,6 +145,8 @@ class ExportRequest(BaseModel):
     include_manifest: bool = True
     sheet_name: str = "Data"
     total_hint: Optional[int] = None
+    # column -> part to extract; the export writes that part in the column.
+    transforms: Dict[str, str] = Field(default_factory=dict)
 
 
 # ------------------------------------------------------------------- recents
@@ -369,6 +382,12 @@ def open_dataset(request: OpenRequest) -> Dict[str, Any]:
     return dataset.as_dict()
 
 
+@app.post("/api/union")
+def union_datasets(request: UnionRequest) -> Dict[str, Any]:
+    dataset = _guard(engine.open_union, request.paths, request.source_column)
+    return dataset.as_dict()
+
+
 @app.post("/api/upload")
 async def upload(file: UploadFile = File(...)) -> Dict[str, Any]:
     if not file.filename or not file.filename.lower().endswith(".parquet"):
@@ -400,6 +419,7 @@ def preview(request: QueryRequest) -> Dict[str, Any]:
     return _guard(
         engine.preview, dataset, request.filters, request.columns,
         limit, max(0, int(request.offset)), request.order_by, request.descending,
+        request.transforms,
     )
 
 
@@ -416,13 +436,14 @@ def values(request: ValuesRequest) -> Dict[str, Any]:
     return _guard(
         engine.distinct_values, dataset, request.column, request.filters,
         request.search, max(1, min(int(request.limit), 2000)), request.exact,
+        request.transform,
     )
 
 
 @app.post("/api/stats")
 def stats(request: StatsRequest) -> Dict[str, Any]:
     dataset = _guard(engine.get, request.dataset_id)
-    return _guard(engine.column_stats, dataset, request.column, request.filters)
+    return _guard(engine.column_stats, dataset, request.column, request.filters, request.transform)
 
 
 @app.get("/api/pivot/aggregations")
@@ -549,7 +570,7 @@ def start_export(request: ExportRequest) -> Dict[str, Any]:
     job = _guard(
         exports.start, request.dataset_id, request.format, request.filters, request.columns,
         request.order_by, request.descending, request.row_limit, request.include_manifest,
-        request.sheet_name or "Data", request.total_hint,
+        request.sheet_name or "Data", request.total_hint, request.transforms,
     )
     return job.as_dict()
 

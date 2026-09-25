@@ -1470,3 +1470,49 @@ a.btn { display: inline-flex; align-items: center; justify-content: center; }
 }
 .paste-note { color: var(--text-dim); }
 .paste-missing { margin-top: 4px; color: var(--text-faint); overflow-wrap: anywhere; }
+
+/* union panel on the welcome card */
+.union-toggle { display: inline-block; margin: -8px 0 20px; font-size: 13px; }
+.union-panel {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 16px;
+  margin-bottom: 20px;
+}
+.union-head { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+.union-head b { font-size: 14px; }
+.union-list { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 8px; counter-reset: union; }
+.union-row { display: flex; gap: 8px; align-items: center; counter-increment: union; }
+.union-row::before {
+  content: counter(union);
+  width: 18px; flex-shrink: 0;
+  font-size: 12px; color: var(--text-faint); text-align: right;
+}
+.union-row .input { flex: 1; min-width: 0; }
+.union-source { margin: 14px 0 0; }
+.union-source code { font-size: 12px; }
+.union-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+@media (max-width: 600px) {
+  .union-row { flex-wrap: wrap; }
+  .union-row .input { flex-basis: calc(100% - 26px); }
+}
+.union-error { margin-top: 14px; }
+
+/* extract a date part (filter popover) */
+.pop-extract {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px 9px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.pop-extract[hidden] { display: none; }
+.pop-extract-label { font-size: 12px; font-weight: 600; color: var(--text-dim); }
+.seg { display: inline-flex; border: 1px solid var(--border-strong); border-radius: 7px; overflow: hidden; }
+.seg-btn {
+  background: none; border: 0; color: var(--text-dim);
+  font: inherit; font-size: 12px; padding: 4px 10px; cursor: pointer;
+}
+.seg-btn + .seg-btn { border-left: 1px solid var(--border-strong); }
+.seg-btn:hover { background: var(--surface-hover); color: var(--text); }
+.seg-btn.active { background: var(--accent); color: var(--accent-ink, #1a1a24); font-weight: 600; }
+.th-type.extracted, .col-type.extracted { color: var(--accent-text, var(--accent)); }

@@ -17,6 +17,7 @@ const state = {
   dataset: null,
   mode: 'data',         // 'data' (row grid) | 'pivot' (cross-tab)
   filters: {},          // column name -> filter spec
+  transforms: {},       // column name -> 'year' | 'month' | 'day' extracted in the grid + export
   hidden: new Set(),    // columns excluded from preview + export
   sort: null,           // { column, descending }
   pageSize: 10,
@@ -144,6 +145,73 @@ function describeFilter(spec) {
 }
 
 const activeFilters = () => Object.values(state.filters);
+
+/* ─────────────────────────── extracting date parts ─────────────────────────── */
+
+const EXTRACT_PARTS = [['year', 'Year'], ['month', 'Month'], ['day', 'Day']];
+
+// Only calendar values have a year, month and day -- not TIME or INTERVAL.
+const canExtract = (column) => column.category === 'temporal' && /^(DATE|TIMESTAMP)/i.test(column.type);
+
+const rawColumn = (name) => state.dataset.columns.find((c) => c.name === name);
+
+/* The column as the Data view presents it: an extracted date column is a plain
+   integer column (2023, 2024…), so its filter panel offers number tools. */
+function effectiveColumn(column) {
+  const raw = rawColumn(column.name) || column;
+  const part = state.transforms[raw.name];
+  return part ? { ...raw, type: 'BIGINT', category: 'numeric', transform: part, rawType: raw.type } : raw;
+}
+
+function typeLabel(name, fallback) {
+  const part = state.transforms[name];
+  const raw = rawColumn(name);
+  return part && raw ? `${part} of ${raw.type}` : fallback;
+}
+
+function setExtract(name, part) {
+  const previous = state.transforms[name] || null;
+  part = part || null;
+  if (part === previous) return;
+  if (part) state.transforms[name] = part;
+  else delete state.transforms[name];
+
+  // The old filter was on the other shape of the column (dates vs years), so
+  // it no longer means anything.
+  const spec = state.filters[name];
+  const dropped = Boolean(spec && (spec.transform || null) !== part);
+  if (dropped) {
+    delete state.filters[name];
+    toast(`Cleared the filter on ${name} — it was set on ${previous ? `the ${previous}` : 'the full value'}.`);
+  }
+  state.page = 0;
+  renderChips();
+  renderRail();
+  refresh({ countUnchanged: !dropped });
+  renderExportSummary();
+  if (pop.column && pop.column.name === name) openFilterPopover(rawColumn(name), pop.anchor);
+}
+
+function renderExtractBar(column) {
+  const bar = $('pop-extract');
+  bar.innerHTML = '';
+  const raw = rawColumn(column.name);
+  // Extraction shapes the Data grid and its export, so it is set from there.
+  bar.hidden = !raw || !canExtract(raw) || state.mode !== 'data';
+  if (bar.hidden) return;
+  bar.appendChild(el('span', 'pop-extract-label', 'Extract'));
+  const group = el('div', 'seg');
+  for (const [part, label] of [['', 'Full value'], ...EXTRACT_PARTS]) {
+    const active = (state.transforms[raw.name] || '') === part;
+    const button = el('button', `seg-btn${active ? ' active' : ''}`, label);
+    button.title = part
+      ? `Show and export only the ${part} of ${raw.name}, as a number`
+      : `Show and export ${raw.name} as it is`;
+    button.onclick = () => setExtract(raw.name, part);
+    group.appendChild(button);
+  }
+  bar.appendChild(group);
+}
 const visibleColumns = () =>
   state.dataset.columns.filter((c) => !state.hidden.has(c.name)).map((c) => c.name);
 
@@ -182,6 +250,75 @@ async function uploadFile(file) {
   }
 }
 
+/* -- union -- */
+
+function unionRow(value = '') {
+  const item = el('li', 'union-row');
+  const input = el('input', 'input mono');
+  input.type = 'text';
+  input.spellcheck = false;
+  input.placeholder = '/absolute/path/to/file.parquet';
+  input.value = value;
+  input.onkeydown = (event) => { if (event.key === 'Enter') openUnion(); };
+  const browse = el('button', 'btn', 'Browse…');
+  browse.onclick = () => openBrowser(browseCurrent, input);
+  const remove = el('button', 'btn icon ghost', '×');
+  remove.title = 'Remove this file';
+  remove.onclick = () => {
+    item.remove();
+    syncUnionRows();
+  };
+  item.append(input, browse, remove);
+  return item;
+}
+
+function syncUnionRows() {
+  const rows = [...$('union-list').children];
+  // Two files is the least a union can be, so the first two can't be removed.
+  rows.forEach((row) => { row.querySelector('.icon').style.visibility = rows.length > 2 ? '' : 'hidden'; });
+}
+
+function toggleUnion(show) {
+  const panel = $('union-panel');
+  panel.hidden = !show;
+  $('btn-union-toggle').hidden = show;
+  if (show && !$('union-list').children.length) {
+    // Start from whatever is already in the main path box.
+    $('union-list').append(unionRow($('path-input').value.trim()), unionRow());
+    syncUnionRows();
+  }
+  if (show) {
+    const empty = [...$('union-list').querySelectorAll('input')].find((input) => !input.value);
+    (empty || $('union-list').querySelector('input')).focus();
+  }
+}
+
+async function openUnion() {
+  const paths = [...$('union-list').querySelectorAll('input')]
+    .map((input) => input.value.trim()).filter(Boolean);
+  if (paths.length < 2) {
+    setUnionError('Enter at least two files to union.');
+    return;
+  }
+  setUnionError('');
+  $('btn-union-open').disabled = true;
+  try {
+    const dataset = await api('/api/union', { paths, source_column: $('union-source').checked });
+    mountDataset(dataset);
+  } catch (error) {
+    setUnionError(error.message);
+  } finally {
+    $('btn-union-open').disabled = false;
+  }
+}
+
+// Shown inside the panel, next to the button that caused it.
+function setUnionError(message) {
+  const node = $('union-error');
+  node.textContent = message || '';
+  node.hidden = !message;
+}
+
 function setOpenError(message) {
   const node = $('open-error');
   node.textContent = message || '';
@@ -191,6 +328,7 @@ function setOpenError(message) {
 function mountDataset(dataset) {
   state.dataset = dataset;
   state.filters = {};
+  state.transforms = {};
   state.hidden = new Set();
   state.sort = null;
   state.page = 0;
@@ -299,8 +437,10 @@ function renderRail() {
     if (isKey) nameRow.appendChild(el('span', 'role-tag key', 'KEY'));
     else if (isExplain) nameRow.appendChild(el('span', 'role-tag explains', 'EXPLAINS'));
     body.appendChild(nameRow);
-    body.appendChild(el('div', 'col-type', column.type));
-    body.title = `${column.name} · ${column.type}`;
+    // Extraction is a Data view setting; Pivot and Difference read raw values.
+    const shownType = state.mode === 'data' ? typeLabel(column.name, column.type) : column.type;
+    body.appendChild(el('div', `col-type${shownType !== column.type ? ' extracted' : ''}`, shownType));
+    body.title = `${column.name} · ${shownType}`;
 
     const actions = el('div', 'col-actions');
 
@@ -386,10 +526,11 @@ function renderChips() {
     const { op, value } = describeFilter(spec);
 
     const label = el('span', 'chip-label');
-    label.appendChild(Object.assign(el('b'), { textContent: spec.column }));
+    const subject = spec.transform ? `${spec.column} (${spec.transform})` : spec.column;
+    label.appendChild(Object.assign(el('b'), { textContent: subject }));
     label.appendChild(Object.assign(el('i'), { textContent: ` ${op} ` }));
     label.appendChild(document.createTextNode(value));
-    label.title = `${spec.column} ${op} ${value}\nClick to edit`;
+    label.title = `${subject} ${op} ${value}\nClick to edit`;
     label.onclick = () => {
       const column = state.dataset.columns.find((c) => c.name === spec.column);
       if (column) openFilterPopover(column, chip);
@@ -456,6 +597,7 @@ async function refresh({ countUnchanged = false } = {}) {
       offset: state.page * state.pageSize,
       order_by: state.sort ? state.sort.column : null,
       descending: state.sort ? state.sort.descending : false,
+      transforms: state.transforms,
     });
     if (token !== state.reqToken) return;
     state.lastMs = performance.now() - started;
@@ -493,8 +635,10 @@ function renderGrid(data) {
     if (state.sort && state.sort.column === column.name) {
       nameRow.appendChild(el('span', 'th-sort', state.sort.descending ? ' ▼' : ' ▲'));
     }
-    label.append(nameRow, el('div', 'th-type', column.type));
-    label.title = `${column.name} · ${column.type}\nClick to sort`;
+    const extracted = Boolean(state.transforms[column.name]);
+    const shownType = typeLabel(column.name, column.type);
+    label.append(nameRow, el('div', `th-type${extracted ? ' extracted' : ''}`, shownType));
+    label.title = `${column.name} · ${shownType}\nClick to sort`;
     label.onclick = () => cycleSort(column.name);
 
     const filterBtn = el('button', `th-filter${isFiltered ? ' active' : ''}`, '▼');
@@ -618,6 +762,7 @@ function tabsFor(category) {
 const TAB_LABELS = { values: 'Values', range: 'Range', condition: 'Condition' };
 
 function openFilterPopover(column, anchor) {
+  column = effectiveColumn(column);
   pop.column = column;
   pop.anchor = anchor;
   pop.draft = JSON.parse(JSON.stringify(state.filters[column.name] || { column: column.name }));
@@ -643,7 +788,8 @@ function openFilterPopover(column, anchor) {
   }
 
   $('pop-title').textContent = column.name;
-  $('pop-type').textContent = column.type;
+  $('pop-type').textContent = typeLabel(column.name, column.type);
+  renderExtractBar(column);
   $('pop-clear').hidden = !state.filters[column.name];
 
   const tabBar = $('pop-tabs');
@@ -664,6 +810,9 @@ function openFilterPopover(column, anchor) {
 }
 
 function positionPopover(anchor) {
+  // The grid re-renders under an open popover (e.g. after an extraction);
+  // a detached anchor has no position, so stay where we are.
+  if (!anchor || !anchor.isConnected) return;
   const node = $('popover');
   const box = anchor.getBoundingClientRect();
   const width = node.offsetWidth || 340;
@@ -794,6 +943,7 @@ async function loadValues(search = '', listNode = null, exact = null) {
       filters: activeFilters(),
       search,
       exact,
+      transform: column.transform || null,
       limit: exact ? Math.max(300, exact.length) : 300,
     });
     if (!pop.column || pop.column.name !== column.name || pop.pasted !== pasted) return;
@@ -934,6 +1084,7 @@ async function loadStats() {
       dataset_id: state.dataset.id,
       column: column.name,
       filters: activeFilters(),
+      transform: column.transform || null,
     });
     if (!pop.column || pop.column.name !== column.name) return null;
     pop.stats = data;
@@ -1112,6 +1263,10 @@ function applyFilter() {
   const draft = pop.draft;
   const column = pop.column;
   draft.column = column.name;
+  // A filter on an extracted part says so, so it means "year = 2024" wherever
+  // it is read -- the Pivot and Difference tabs included.
+  if (column.transform) draft.transform = column.transform;
+  else delete draft.transform;
 
   if (pop.tab === 'values') {
     draft.op = draft.op === 'not_in' ? 'not_in' : 'in';
@@ -1276,6 +1431,11 @@ function renderExportSummary() {
     ['Filters applied', String(activeFilters().length)],
     ['Columns', `${visibleColumns().length} of ${state.dataset.columns.length}`],
   ];
+  const visible = new Set(visibleColumns());
+  const extracted = Object.entries(state.transforms).filter(([name]) => visible.has(name));
+  if (extracted.length) {
+    rows.push(['Extracted', extracted.map(([name, part]) => `${name} → ${part}`).join(', ')]);
+  }
   for (const [label, value] of rows) {
     const row = el('div', 'summary-row');
     row.append(el('span', null, label), el('span', null, value));
@@ -1432,6 +1592,7 @@ async function startExport() {
     include_manifest: $('export-manifest').checked,
     sheet_name: $('export-sheet').value.trim() || 'Data',
     total_hint: state.matched,
+    transforms: state.transforms,
   };
 
   $('btn-start-export').disabled = true;
@@ -1548,8 +1709,24 @@ async function cancelExport() {
 /* ─────────────────────────── file browser ─────────────────────────── */
 
 let browseCurrent = null;
+// The union row's input a pick should fill; null means "open what is picked".
+let browseTarget = null;
 
-async function openBrowser(path) {
+function pickBrowsed(path) {
+  const target = browseTarget;
+  closeBrowser();
+  if (target) {
+    target.value = path;
+    target.focus();
+  } else {
+    openPath(path);
+  }
+}
+
+async function openBrowser(path, target = null) {
+  browseTarget = target;
+  $('browse-title').textContent = target ? 'Choose a file to union' : 'Choose a parquet file';
+  $('browse-open-dir').textContent = target ? 'Use this folder' : 'Open this folder as a dataset';
   try {
     const data = await api(`/api/browse?path=${encodeURIComponent(path || '~')}`, undefined, 'GET');
     browseCurrent = data.path;
@@ -1561,7 +1738,7 @@ async function openBrowser(path) {
       const up = el('li');
       const button = el('button', 'browse-item');
       button.append(el('span', 'browse-icon', '↰'), el('span', 'browse-name', '..'));
-      button.onclick = () => openBrowser(data.parent);
+      button.onclick = () => openBrowser(data.parent, browseTarget);
       up.appendChild(button);
       list.appendChild(up);
     }
@@ -1575,8 +1752,8 @@ async function openBrowser(path) {
         el('span', 'browse-size', entry.is_dir ? '' : fmtBytes(entry.size))
       );
       button.onclick = () => {
-        if (entry.is_dir) openBrowser(entry.path);
-        else { closeBrowser(); openPath(entry.path); }
+        if (entry.is_dir) openBrowser(entry.path, browseTarget);
+        else pickBrowsed(entry.path);
       };
       item.appendChild(button);
       list.appendChild(item);
@@ -1593,6 +1770,7 @@ async function openBrowser(path) {
 }
 
 function closeBrowser() {
+  browseTarget = null;
   $('browse-scrim').hidden = true;
   $('browse-modal').hidden = true;
 }
@@ -2378,7 +2556,16 @@ function wire() {
   $('btn-browse').onclick = () => openBrowser(browseCurrent);
   $('browse-close').onclick = closeBrowser;
   $('browse-scrim').onclick = closeBrowser;
-  $('browse-open-dir').onclick = () => { closeBrowser(); openPath(browseCurrent); };
+  $('browse-open-dir').onclick = () => pickBrowsed(browseCurrent);
+  $('btn-union-toggle').onclick = () => toggleUnion(true);
+  $('btn-union-cancel').onclick = () => { toggleUnion(false); setUnionError(''); };
+  $('btn-union-add').onclick = () => {
+    const row = unionRow();
+    $('union-list').appendChild(row);
+    syncUnionRows();
+    row.querySelector('input').focus();
+  };
+  $('btn-union-open').onclick = openUnion;
   $('btn-change-file').onclick = unmountDataset;
 
   const zone = $('drop-zone');

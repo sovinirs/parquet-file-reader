@@ -44,6 +44,27 @@
       <button class="btn" id="btn-browse">Browse…</button>
     </div>
 
+    <button class="link-btn union-toggle" id="btn-union-toggle">Union several files with the same columns…</button>
+    <div class="union-panel" id="union-panel" hidden>
+      <div class="union-head">
+        <b>Union files into one table</b>
+        <span class="hint">Rows from every file are stacked together. Columns are matched by
+          name, so their order can differ, but every file needs the same column names and types.
+          A folder of parquet parts counts as one file.</span>
+      </div>
+      <ol class="union-list" id="union-list"></ol>
+      <button class="link-btn" id="btn-union-add">+ Add another file</button>
+      <label class="check union-source">
+        <input type="checkbox" id="union-source" checked />
+        <span>Add a <code>source_file</code> column showing which file each row came from</span>
+      </label>
+      <div class="open-error union-error" id="union-error" hidden></div>
+      <div class="union-actions">
+        <button class="btn ghost" id="btn-union-cancel">Cancel</button>
+        <button class="btn primary" id="btn-union-open">Union and open</button>
+      </div>
+    </div>
+
     <div class="or-line"><span>or drop a .parquet file here</span></div>
     <p class="hint">
       Dropped files are copied to a temp folder first. For very large files, paste the
@@ -381,6 +402,8 @@
     <button class="btn icon ghost" id="pop-close" title="Close">×</button>
   </header>
 
+  <div class="pop-extract" id="pop-extract" hidden></div>
+
   <nav class="tabs" id="pop-tabs"></nav>
   <div class="pop-body" id="pop-body"></div>
 
@@ -457,7 +480,7 @@
 <div class="scrim" id="browse-scrim" hidden></div>
 <div class="modal" id="browse-modal" hidden>
   <header class="modal-head">
-    <h2>Choose a parquet file</h2>
+    <h2 id="browse-title">Choose a parquet file</h2>
     <button class="btn icon ghost" id="browse-close">×</button>
   </header>
   <div class="crumb mono" id="browse-path"></div>

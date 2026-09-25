@@ -240,7 +240,7 @@ def _scan(engine: Engine, dataset: Dataset, config: DiffConfig,
     where, params = build_where(config.filters, dataset.column_types)
     # engine._from() rather than another copy of the literal: the source
     # expression stays identical to every other query in the app.
-    source = "FROM {} AS t".format(engine._from())
+    source = "FROM {} AS t".format(engine._from(dataset))
     if plan is not None and plan.sample_table:
         source += ' SEMI JOIN "{}" AS s ON t.{} IS NOT DISTINCT FROM s.k'.format(
             plan.sample_table, quote_ident(config.key_column))
@@ -638,7 +638,7 @@ def summarise(dataset: Dataset, config: DiffConfig, plan: RunPlan,
         by_verdict[result.verdict] = by_verdict.get(result.verdict, 0) + 1
     return {
         "config": config.as_dict(),
-        "dataset": {"name": dataset.display_name, "path": dataset.path,
+        "dataset": {"name": dataset.display_name, "path": dataset.path_label,
                     "row_count": dataset.row_count},
         "rows_analysed": plan.rows,
         "assets_analysed": plan.assets,

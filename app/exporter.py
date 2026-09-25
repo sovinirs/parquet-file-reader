@@ -180,8 +180,11 @@ class ExportManager:
         include_manifest: bool = True,
         sheet_name: str = "Data",
         total_hint: Optional[int] = None,
+        transforms: Optional[Dict[str, str]] = None,
     ) -> ExportJob:
         dataset = self.engine.get(dataset_id)
+        # Refuse a bad extraction now, as a 400, rather than as a failed job.
+        self.engine._select_list(dataset, columns, transforms)
         stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         base = os.path.splitext(dataset.display_name)[0][:60] or "export"
         ext = {"xlsx": "xlsx", "csv": "csv", "parquet": "parquet", "json": "json"}[fmt]
@@ -200,7 +203,7 @@ class ExportManager:
             self.jobs[job.id] = job
 
         args = (job, dataset, filters, list(columns or []), order_by, descending,
-                row_limit, include_manifest, sheet_name)
+                row_limit, include_manifest, sheet_name, dict(transforms or {}))
         threading.Thread(target=self._run, args=args, daemon=True).start()
         self.cleanup()
         return job
@@ -282,7 +285,7 @@ class ExportManager:
     # ------------------------------------------------------------------ worker
 
     def _run(self, job, dataset, filters, columns, order_by, descending,
-             row_limit, include_manifest, sheet_name):
+             row_limit, include_manifest, sheet_name, transforms=None):
         try:
             if job.total is None:
                 job.status = "counting"
@@ -299,10 +302,10 @@ class ExportManager:
 
             if job.fmt == "xlsx":
                 self._write_xlsx(job, dataset, filters, columns, order_by, descending,
-                                 row_limit, include_manifest, sheet_name)
+                                 row_limit, include_manifest, sheet_name, transforms)
             else:
                 self.engine.copy_to(dataset, job.path, job.fmt, filters, columns, order_by, descending,
-                                    row_limit)
+                                    row_limit, transforms)
                 job.written = job.total or 0
 
             if job._cancel.is_set():
@@ -333,7 +336,7 @@ class ExportManager:
                 pass
 
     def _write_xlsx(self, job, dataset, filters, columns, order_by, descending,
-                    row_limit, include_manifest, sheet_name):
+                    row_limit, include_manifest, sheet_name, transforms=None):
         book = xlsxwriter.Workbook(
             job.path,
             {"constant_memory": True, "default_date_format": "yyyy-mm-dd hh:mm:ss", "remove_timezone": True},
@@ -351,7 +354,7 @@ class ExportManager:
 
             if include_manifest:
                 self._write_manifest(book, job, dataset, filters, columns,
-                                     order_by, descending, title_fmt, label_fmt)
+                                     order_by, descending, title_fmt, label_fmt, transforms)
 
             sheet = None
             row_in_sheet = 0
@@ -376,7 +379,8 @@ class ExportManager:
                 job.sheets = sheet_index
 
             for batch_columns, rows in self.engine.iter_rows(
-                dataset, filters, columns, order_by, descending, row_limit=row_limit
+                dataset, filters, columns, order_by, descending, row_limit=row_limit,
+                transforms=transforms,
             ):
                 if not chosen:
                     chosen = batch_columns
@@ -417,7 +421,7 @@ class ExportManager:
 
             if sheet is None:
                 # No matching rows: still produce a usable, correctly-headed sheet.
-                chosen = self.engine._select_list(dataset, columns)[1]
+                chosen = self.engine._select_list(dataset, columns, transforms)[1]
                 col_formats = [None] * len(chosen)
                 new_sheet()
             else:
@@ -429,19 +433,22 @@ class ExportManager:
 
     @staticmethod
     def _write_manifest(book, job, dataset, filters, columns, order_by, descending,
-                        title_fmt, label_fmt):
+                        title_fmt, label_fmt, transforms=None):
         sheet = book.add_worksheet("Export info")
         sheet.set_column(0, 0, 22)
         sheet.set_column(1, 1, 90)
         sheet.write(0, 0, "Export summary", title_fmt)
 
         rows = [
-            ("Source file", dataset.path),
+            ("Source file", dataset.path_label),
             ("Exported at", _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             ("Rows in file", "{:,}".format(dataset.row_count)),
             ("Rows exported", "{:,}".format(job.total) if job.total is not None else "unknown"),
             ("Columns exported", ", ".join(columns) if columns else "all ({})".format(len(dataset.columns))),
             ("Sort", "{} {}".format(order_by, "desc" if descending else "asc") if order_by else "none"),
+            ("Extracted", ", ".join("{} → {} only".format(name, part)
+                                    for name, part in sorted((transforms or {}).items())
+                                    if not columns or name in columns) or "none"),
         ]
         line = 2
         for label, value in rows:
@@ -676,7 +683,7 @@ class ExportManager:
 
         sample = spec.get("sample_assets")
         rows = [
-            ("Source file", dataset.path),
+            ("Source file", dataset.path_label),
             ("Exported at", _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             ("Rows in file", "{:,}".format(dataset.row_count)),
             ("Record consistency", record_text),
@@ -974,7 +981,7 @@ class ExportManager:
 
         values = ", ".join(v["label"] for v in result["values"]) or "none"
         rows = [
-            ("Source file", dataset.path),
+            ("Source file", dataset.path_label),
             ("Exported at", _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
             ("Rows in file", "{:,}".format(dataset.row_count)),
             ("Row fields", ", ".join(c["name"] for c in result["row_fields"]) or "none"),

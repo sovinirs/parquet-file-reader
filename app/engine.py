@@ -15,7 +15,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import duckdb
 
-from .filters import FilterError, build_where, quote_ident
+from .filters import FilterError, build_where, column_sql, quote_ident
 
 NUMERIC_PREFIXES = (
     "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT",
@@ -77,23 +77,42 @@ class Column:
 @dataclass
 class Dataset:
     id: str
-    path: str
+    # One source (a file, or a glob over a folder's parts) -- or, for a union,
+    # a list of them. DuckDB's read_parquet takes either as its parameter, so
+    # every query in the app handles both without knowing which it has.
+    path: Any
     display_name: str
     columns: List[Column]
     row_count: int
     file_size: int
     file_count: int
     is_temp: bool = False
+    # Set on a union that tags each row with the file it came from.
+    source_column: Optional[str] = None
+    # Tag rows with the bare file name rather than the full path -- true unless
+    # two of the unioned files share a name.
+    source_basename: bool = True
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
     def column_types(self) -> Dict[str, str]:
         return {c.name: c.sql_type for c in self.columns}
 
+    @property
+    def sources(self) -> List[str]:
+        return list(self.path) if isinstance(self.path, (list, tuple)) else [self.path]
+
+    @property
+    def path_label(self) -> str:
+        """The source(s) as one line of text, for titles and export manifests."""
+        return " + ".join(self.sources)
+
     def as_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id,
-            "path": self.path,
+            "path": self.path_label,
+            "sources": self.sources,
+            "source_column": self.source_column,
             "name": self.display_name,
             "columns": [c.as_dict() for c in self.columns],
             "row_count": self.row_count,
@@ -169,6 +188,91 @@ class Engine:
         self.datasets[dataset.id] = dataset
         return dataset
 
+    def open_union(self, paths: Sequence[str], source_column: bool = True) -> Dataset:
+        """Open several parquet sources as one table, stacked on top of each other.
+
+        Each source can be a file or a folder of parts. They must share a schema:
+        the same column names with the same types. Column order may differ, since
+        columns are matched by name.
+        """
+        cleaned = [p for p in (str(p).strip() for p in paths or []) if p]
+        if len(cleaned) < 2:
+            raise ValueError("Choose at least two parquet files to union.")
+
+        resolved = [self._resolve(p) for p in cleaned]
+        sources = [source for source, _, _ in resolved]
+        seen = {}
+        for index, source in enumerate(sources):
+            if source in seen:
+                raise ValueError("File {} is the same as file {}: {}".format(
+                    index + 1, seen[source] + 1, source))
+            seen[source] = index
+
+        cur = self.cursor()
+        schemas = []
+        for index, source in enumerate(sources):
+            try:
+                described = cur.execute(
+                    "DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true)", [source]
+                ).fetchall()
+            except duckdb.Error as exc:
+                raise ValueError("Could not read file {} ({}): {}".format(index + 1, source, exc))
+            schemas.append([(row[0], row[1]) for row in described])
+
+        first = dict(schemas[0])
+        problems = []
+        for index, schema in enumerate(schemas[1:], start=2):
+            other = dict(schema)
+            missing = [name for name in first if name not in other]
+            extra = [name for name in other if name not in first]
+            retyped = ["{} ({} vs {})".format(name, first[name], other[name])
+                       for name in first if name in other and first[name] != other[name]]
+            if missing or extra or retyped:
+                bits = []
+                if missing:
+                    bits.append("missing " + ", ".join(missing))
+                if extra:
+                    bits.append("extra " + ", ".join(extra))
+                if retyped:
+                    bits.append("different types: " + ", ".join(retyped))
+                problems.append("File {} ({}) does not match file 1: {}.".format(
+                    index, os.path.basename(sources[index - 1].rstrip(os.sep)), "; ".join(bits)))
+        if problems:
+            raise ValueError("These files do not share a schema, so they cannot be unioned. "
+                             + " ".join(problems))
+
+        columns = [Column(name=n, sql_type=t, category=categorise(t)) for n, t in schemas[0]]
+        tag = None
+        if source_column:
+            taken = {c.name for c in columns}
+            tag = "source_file"
+            suffix = 1
+            while tag in taken:
+                suffix += 1
+                tag = "source_file_{}".format(suffix)
+            columns.append(Column(name=tag, sql_type="VARCHAR", category="text"))
+
+        row_count = cur.execute(
+            "SELECT count(*) FROM read_parquet(?, union_by_name=true)", [sources]
+        ).fetchone()[0]
+
+        names = [os.path.basename(s.rstrip(os.sep)) or s for s in sources]
+        dataset = Dataset(
+            id=uuid.uuid4().hex[:12],
+            path=sources,
+            display_name=" + ".join(names) if len(names) <= 3
+            else "{} + {} more".format(names[0], len(names) - 1),
+            columns=columns,
+            row_count=int(row_count),
+            file_size=sum(size for _, _, size in resolved),
+            file_count=sum(count for _, count, _ in resolved),
+            source_column=tag,
+            # Folders expand to many files, so there the file name alone can repeat.
+            source_basename=all(count == 1 for _, count, _ in resolved) and len(set(names)) == len(names),
+        )
+        self.datasets[dataset.id] = dataset
+        return dataset
+
     def get(self, dataset_id: str) -> Dataset:
         dataset = self.datasets.get(dataset_id)
         if dataset is None:
@@ -177,7 +281,7 @@ class Engine:
 
     def close(self, dataset_id: str) -> None:
         dataset = self.datasets.pop(dataset_id, None)
-        if dataset and dataset.is_temp and os.path.isfile(dataset.path):
+        if dataset and dataset.is_temp and isinstance(dataset.path, str) and os.path.isfile(dataset.path):
             try:
                 os.remove(dataset.path)
             except OSError:
@@ -185,15 +289,46 @@ class Engine:
 
     # ---------------------------------------------------------------- queries
 
-    def _from(self) -> str:
+    @staticmethod
+    def _from(dataset: Optional[Dataset] = None) -> str:
+        """The table expression every query reads from; its one parameter is dataset.path."""
+        if dataset is not None and dataset.source_column:
+            # The names here are generated by open_union, never user input.
+            # DuckDB pushes filters and projections through this subquery, so
+            # it reads no more of the files than the bare read_parquet would.
+            tag = "parse_filename(__pqs_src)" if dataset.source_basename else "__pqs_src"
+            return ("(SELECT * EXCLUDE (__pqs_src), {} AS {} "
+                    "FROM read_parquet(?, union_by_name=true, filename='__pqs_src'))").format(
+                        tag, quote_ident(dataset.source_column))
         return "read_parquet(?, union_by_name=true)"
 
-    def _select_list(self, dataset: Dataset, columns: Optional[Sequence[str]]) -> Tuple[str, List[Column]]:
+    def _select_list(
+        self,
+        dataset: Dataset,
+        columns: Optional[Sequence[str]],
+        transforms: Optional[Dict[str, str]] = None,
+    ) -> Tuple[str, List[Column]]:
+        """SELECT list for the grid/export. An extracted column keeps its name but
+        holds just the part -- `year("order_date") AS "order_date"` -- and is
+        reported with the part's type, so Excel writes it as a number."""
+        transforms = transforms or {}
+        for name in transforms:
+            if name not in dataset.column_types:
+                raise FilterError("Unknown column: {!r}".format(name))
         known = {c.name: c for c in dataset.columns}
         chosen = [known[c] for c in columns if c in known] if columns else list(dataset.columns)
         if not chosen:
             chosen = list(dataset.columns)
-        return ", ".join(quote_ident(c.name) for c in chosen), chosen
+        parts, shaped = [], []
+        for column in chosen:
+            if transforms.get(column.name):
+                expr, sql_type = column_sql(column.name, column.sql_type, transforms[column.name])
+                parts.append("{} AS {}".format(expr, quote_ident(column.name)))
+                shaped.append(Column(name=column.name, sql_type=sql_type, category=categorise(sql_type)))
+            else:
+                parts.append(quote_ident(column.name))
+                shaped.append(column)
+        return ", ".join(parts), shaped
 
     def query_sql(
         self,
@@ -202,14 +337,17 @@ class Engine:
         columns: Optional[Sequence[str]] = None,
         order_by: Optional[str] = None,
         descending: bool = False,
+        transforms: Optional[Dict[str, str]] = None,
     ) -> Tuple[str, List[Any], List[Column]]:
-        select_list, chosen = self._select_list(dataset, columns)
+        select_list, chosen = self._select_list(dataset, columns, transforms)
         where, params = build_where(filters, dataset.column_types)
-        sql = "SELECT {} FROM {} {}".format(select_list, self._from(), where)
+        sql = "SELECT {} FROM {} {}".format(select_list, self._from(dataset), where)
         if order_by and order_by in dataset.column_types:
-            sql += " ORDER BY {} {} NULLS LAST".format(
-                quote_ident(order_by), "DESC" if descending else "ASC"
-            )
+            # Spelled out rather than by name: an extracted column's alias
+            # shadows the raw one, and the sort should follow what is shown.
+            key, _ = column_sql(order_by, dataset.column_types[order_by],
+                                (transforms or {}).get(order_by))
+            sql += " ORDER BY {} {} NULLS LAST".format(key, "DESC" if descending else "ASC")
         return sql, [dataset.path] + params, chosen
 
     def preview(
@@ -221,8 +359,9 @@ class Engine:
         offset: int = 0,
         order_by: Optional[str] = None,
         descending: bool = False,
+        transforms: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        sql, params, chosen = self.query_sql(dataset, filters, columns, order_by, descending)
+        sql, params, chosen = self.query_sql(dataset, filters, columns, order_by, descending, transforms)
         sql += " LIMIT {} OFFSET {}".format(int(limit), int(offset))
         cur = self.cursor()
         rows = cur.execute(sql, params).fetchall()
@@ -233,7 +372,7 @@ class Engine:
 
     def count(self, dataset: Dataset, filters: Sequence[Dict[str, Any]]) -> int:
         where, params = build_where(filters, dataset.column_types)
-        sql = "SELECT count(*) FROM {} {}".format(self._from(), where)
+        sql = "SELECT count(*) FROM {} {}".format(self._from(dataset), where)
         cur = self.cursor()
         return int(cur.execute(sql, [dataset.path] + params).fetchone()[0])
 
@@ -245,17 +384,18 @@ class Engine:
         search: str = "",
         limit: int = 500,
         exact: Optional[Sequence[str]] = None,
+        transform: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Value list for a filter panel, honouring every *other* column's filter.
 
         `exact` is a pasted list: return only values equal to one of them
-        (ignoring case), instead of substring-matching `search`.
+        (ignoring case), instead of substring-matching `search`. `transform`
+        lists an extracted part (the years of a date) instead of the raw values.
         """
         types = dataset.column_types
         if column not in types:
             raise FilterError("Unknown column: {!r}".format(column))
-        sql_type = types[column]
-        col = quote_ident(column)
+        col, sql_type = column_sql(column, types[column], transform)
         expr = col if categorise(sql_type) != "complex" else "CAST({} AS VARCHAR)".format(col)
 
         where, params = build_where(filters, types, skip_column=column)
@@ -272,8 +412,10 @@ class Engine:
 
         sql = (
             "SELECT {expr} AS v, count(*) AS n FROM {src} {where} "
-            "GROUP BY 1 ORDER BY n DESC, 1 LIMIT {lim}"
-        ).format(expr=expr, src=self._from(), where=where, lim=int(limit) + 1)
+            "GROUP BY 1 ORDER BY {order} LIMIT {lim}"
+        ).format(expr=expr, src=self._from(dataset), where=where, lim=int(limit) + 1,
+                 # Years, months and days read best in calendar order.
+                 order="1 NULLS LAST" if transform else "n DESC, 1")
 
         cur = self.cursor()
         rows = cur.execute(sql, params).fetchall()
@@ -286,13 +428,14 @@ class Engine:
         }
 
     def column_stats(
-        self, dataset: Dataset, column: str, filters: Sequence[Dict[str, Any]]
+        self, dataset: Dataset, column: str, filters: Sequence[Dict[str, Any]],
+        transform: Optional[str] = None,
     ) -> Dict[str, Any]:
         types = dataset.column_types
         if column not in types:
             raise FilterError("Unknown column: {!r}".format(column))
-        col = quote_ident(column)
-        category = categorise(types[column])
+        col, sql_type = column_sql(column, types[column], transform)
+        category = categorise(sql_type)
         where, params = build_where(filters, types, skip_column=column)
         params = [dataset.path] + params
 
@@ -309,7 +452,7 @@ class Engine:
             aggregates += ["avg(CAST({0} AS DOUBLE)) AS mean".format(col),
                            "median(CAST({0} AS DOUBLE)) AS med".format(col)]
 
-        sql = "SELECT {} FROM {} {}".format(", ".join(aggregates), self._from(), where)
+        sql = "SELECT {} FROM {} {}".format(", ".join(aggregates), self._from(dataset), where)
         cur = self.cursor()
         row = cur.execute(sql, params).fetchone()
         names = [d[0] for d in cur.description]
@@ -328,9 +471,10 @@ class Engine:
         descending: bool = False,
         chunk_size: int = 50_000,
         row_limit: Optional[int] = None,
+        transforms: Optional[Dict[str, str]] = None,
     ) -> Iterator[Tuple[List[Column], List[Tuple]]]:
         """Stream the filtered result in chunks. Yields (columns, rows) batches."""
-        sql, params, chosen = self.query_sql(dataset, filters, columns, order_by, descending)
+        sql, params, chosen = self.query_sql(dataset, filters, columns, order_by, descending, transforms)
         if row_limit:
             sql += " LIMIT {}".format(int(row_limit))
         cur = self.cursor()
@@ -351,9 +495,10 @@ class Engine:
         order_by: Optional[str] = None,
         descending: bool = False,
         row_limit: Optional[int] = None,
+        transforms: Optional[Dict[str, str]] = None,
     ) -> None:
         """Native DuckDB export -- parallel and far faster than row-by-row."""
-        sql, params, _ = self.query_sql(dataset, filters, columns, order_by, descending)
+        sql, params, _ = self.query_sql(dataset, filters, columns, order_by, descending, transforms)
         if row_limit:
             sql += " LIMIT {}".format(int(row_limit))
         options = {

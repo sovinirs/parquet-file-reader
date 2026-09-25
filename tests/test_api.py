@@ -234,6 +234,189 @@ def diff_checks(call, con):
         check("{} file is non-empty".format(fmt), export["size"] > 0, True)
 
 
+def extract_checks(call, con, src, did):
+    """Extracting a date part: grid, filter panel, filters and exports all agree with SQL."""
+    import re
+    import tempfile
+    import time
+    import zipfile
+
+    print("\nextracting date parts")
+    shown = call("/api/preview", {"dataset_id": did, "filters": [], "limit": 5,
+                                  "columns": ["id", "order_date", "created_at"],
+                                  "order_by": "id", "transforms": {"order_date": "year",
+                                                                   "created_at": "month"}})
+    check("an extracted column keeps its name and becomes an integer",
+          [(c["name"], c["type"], c["category"]) for c in shown["columns"]],
+          [("id", "BIGINT", "numeric"), ("order_date", "BIGINT", "numeric"),
+           ("created_at", "BIGINT", "numeric")])
+    check("the grid shows the year and the month",
+          shown["rows"],
+          [list(r) for r in con.sql("SELECT id, year(order_date), month(created_at) FROM {} "
+                                    "ORDER BY id LIMIT 5".format(src)).fetchall()])
+    day = call("/api/preview", {"dataset_id": did, "filters": [], "limit": 3, "columns": ["order_date"],
+                                "order_by": "order_date", "descending": True,
+                                "transforms": {"order_date": "day"}})
+    check("day extracts the day of the month, and sorting follows it",
+          [r[0] for r in day["rows"]], [31, 31, 31])
+
+    years = call("/api/values", {"dataset_id": did, "column": "order_date", "filters": [],
+                                 "transform": "year"})
+    check("the filter panel lists years, in calendar order",
+          [(v["value"], v["count"]) for v in years["values"]],
+          [tuple(r) for r in con.sql("SELECT year(order_date), count(*) FROM {} GROUP BY 1 ORDER BY 1"
+                                     .format(src)).fetchall()])
+    stats = call("/api/stats", {"dataset_id": did, "column": "created_at", "filters": [],
+                                "transform": "month"})
+    check("range stats describe the months", (stats["lo"], stats["hi"], stats["category"]),
+          (1, 12, "numeric"))
+
+    cases = [
+        ("year is any of", {"column": "order_date", "transform": "year", "op": "in", "values": [2024]},
+         "year(order_date) = 2024"),
+        ("month in a range", {"column": "created_at", "transform": "month", "op": "between",
+                              "value": 3, "value2": 5}, "month(created_at) BETWEEN 3 AND 5"),
+        ("pasted list of days", {"column": "order_date", "transform": "day", "op": "in",
+                                 "values": ["1", "15"], "list": True}, "day(order_date) IN (1, 15)"),
+    ]
+    for label, spec, where in cases:
+        check("filter on an extracted part: " + label,
+              call("/api/count", {"dataset_id": did, "filters": [spec]})["count"],
+              con.sql("SELECT count(*) FROM {} WHERE {}".format(src, where)).fetchone()[0])
+
+    # The Pivot tab groups raw values, but a year filter still means year = 2024.
+    pivot = call("/api/pivot", {"dataset_id": did, "rows": ["region"], "columns": [],
+                                "values": [{"agg": "count_rows"}],
+                                "filters": [cases[0][1]]})
+    north = next(r for r in pivot["rows"] if r["labels"][0] == "north")
+    check("the pivot honours a filter on an extracted part", north["cells"][0],
+          con.sql("SELECT count(*) FROM {} WHERE region = 'north' AND year(order_date) = 2024"
+                  .format(src)).fetchone()[0])
+
+    check("only dates and timestamps can be extracted",
+          call("/api/preview", {"dataset_id": did, "filters": [], "transforms": {"amount": "year"}})
+          .get("HTTP_ERROR"), 400)
+    check("only year, month and day are offered",
+          call("/api/count", {"dataset_id": did, "filters": [
+              {"column": "order_date", "transform": "week", "op": "eq", "value": 3}]}).get("HTTP_ERROR"), 400)
+
+    def export(fmt, **extra):
+        job = call("/api/export", dict({"dataset_id": did, "format": fmt, "include_manifest": False,
+                                        "columns": ["id", "order_date"],
+                                        "filters": [cases[0][1]],
+                                        "order_by": "id", "row_limit": 50,
+                                        "transforms": {"order_date": "year"}}, **extra))
+        deadline = time.time() + 60
+        while job.get("status") in ("queued", "counting", "running") and time.time() < deadline:
+            time.sleep(0.2)
+            job = call("/api/export/{}".format(job["id"]))
+        target = os.path.join(scratch, job["filename"])
+        with urllib.request.urlopen(BASE + "/api/export/{}/download".format(job["id"])) as response, \
+                open(target, "wb") as handle:
+            handle.write(response.read())
+        return target
+
+    with tempfile.TemporaryDirectory() as scratch:
+        out = export("parquet")
+        check("a parquet export writes the year, as an integer column",
+              con.sql("SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_parquet('{}'))"
+                      .format(out)).fetchall(), [("id", "BIGINT"), ("order_date", "BIGINT")])
+        check("and every value is 2024",
+              con.sql("SELECT DISTINCT order_date FROM read_parquet('{}')".format(out)).fetchall(),
+              [(2024,)])
+
+        out = export("xlsx")
+        with zipfile.ZipFile(out) as book:
+            sheet = book.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        cells = re.findall(r'<c r="B(\d+)"([^>]*)>(.*?)</c>', sheet)
+        header = next(body for row, _, body in cells if row == "1")
+        data = [(attrs, body) for row, attrs, body in cells if row != "1"]
+        check("an excel export keeps the column header", "order_date" in header, True)
+        check("and writes 50 plain numbers, not dates",
+              (len(data), {body for _, body in data}, any(' s="' in attrs for attrs, _ in data)),
+              (50, {"<v>2024</v>"}, False))
+
+        manifest = export("xlsx", include_manifest=True)
+        with zipfile.ZipFile(manifest) as book:
+            text = " ".join(book.read(name).decode("utf-8") for name in book.namelist()
+                            if name.startswith("xl/worksheets/") or name == "xl/sharedStrings.xml")
+        check("the export info sheet records the extraction", "order_date → year only" in text, True)
+
+
+def union_checks(call, con, src):
+    """Two halves of the sample, unioned back, must behave exactly like the whole."""
+    import tempfile
+    import time
+
+    print("\nunion")
+    with tempfile.TemporaryDirectory() as scratch:
+        first = os.path.join(scratch, "orders_early.parquet")
+        second = os.path.join(scratch, "orders_late.parquet")
+        retyped = os.path.join(scratch, "orders_retyped.parquet")
+        con.execute("COPY (SELECT * FROM {} WHERE id < 1000000) TO '{}'".format(src, first))
+        # Same columns in a different order: matched by name, so still a union.
+        con.execute("COPY (SELECT * EXCLUDE (amount), amount FROM {} WHERE id >= 1000000) TO '{}'"
+                    .format(src, second))
+        con.execute("COPY (SELECT * REPLACE (CAST(amount AS VARCHAR) AS amount) FROM {} LIMIT 5) TO '{}'"
+                    .format(src, retyped))
+
+        union = call("/api/union", {"paths": [first, second]})
+        uid = union.get("id")
+        total = con.sql("SELECT count(*) FROM {}".format(src)).fetchone()[0]
+        check("union stacks every row", union.get("row_count"), total)
+        check("union is named after its files", union.get("name"),
+              "orders_early.parquet + orders_late.parquet")
+        check("union adds a source_file column", union["columns"][-1],
+              {"name": "source_file", "type": "VARCHAR", "category": "text"})
+        values = call("/api/values", {"dataset_id": uid, "column": "source_file", "filters": []})
+        check("source_file holds each file's name and row count",
+              sorted((v["value"], v["count"]) for v in values["values"]),
+              [("orders_early.parquet", 1000000), ("orders_late.parquet", total - 1000000)])
+
+        filters = [{"column": "source_file", "op": "in", "values": ["orders_late.parquet"]},
+                   {"column": "region", "op": "in", "values": ["north"]}]
+        check("filters work across the union, source_file included",
+              call("/api/count", {"dataset_id": uid, "filters": filters})["count"],
+              con.sql("SELECT count(*) FROM {} WHERE id >= 1000000 AND region = 'north'"
+                      .format(src)).fetchone()[0])
+
+        pivot = call("/api/pivot", {"dataset_id": uid, "rows": ["source_file"], "columns": [],
+                                    "values": [{"column": "amount", "agg": "sum"}], "filters": []})
+        early = next(r for r in pivot["rows"] if r["labels"][0] == "orders_early.parquet")
+        check("pivot groups by source_file",
+              round(early["cells"][0], 2),
+              round(con.sql("SELECT sum(amount) FROM {} WHERE id < 1000000".format(src)).fetchone()[0], 2))
+
+        job = call("/api/export", {"dataset_id": uid, "format": "parquet", "filters": filters,
+                                   "columns": ["id", "source_file"], "row_limit": 3})
+        deadline = time.time() + 60
+        while job["status"] in ("queued", "counting", "running") and time.time() < deadline:
+            time.sleep(0.2)
+            job = call("/api/export/{}".format(job["id"]))
+        target = os.path.join(scratch, "out.parquet")
+        with urllib.request.urlopen(BASE + "/api/export/{}/download".format(job["id"])) as response, \
+                open(target, "wb") as handle:
+            handle.write(response.read())
+        check("a union exports to parquet with source_file",
+              con.sql("SELECT DISTINCT source_file FROM read_parquet('{}')".format(target)).fetchall(),
+              [("orders_late.parquet",)])
+
+        plain = call("/api/union", {"paths": [first, second], "source_column": False})
+        check("source_file can be left out",
+              [c["name"] for c in plain["columns"]][-1] != "source_file", True)
+
+        bad = call("/api/union", {"paths": [first, retyped]})
+        check("a type mismatch is refused", bad.get("HTTP_ERROR"), 400)
+        check("and the error names the column", "amount (DOUBLE vs VARCHAR)" in (bad.get("detail") or ""), True)
+        check("the same file twice is refused", call("/api/union", {"paths": [first, first]}).get("HTTP_ERROR"), 400)
+        check("one file is not a union", call("/api/union", {"paths": [first]}).get("HTTP_ERROR"), 400)
+        check("a missing file is reported",
+              call("/api/union", {"paths": [first, first + ".nope"]}).get("HTTP_ERROR"), 404)
+
+        for dataset_id in (uid, plain.get("id")):
+            call("/api/dataset/{}".format(dataset_id), method="DELETE")
+
+
 def main():
     import duckdb
 
@@ -569,6 +752,9 @@ def main():
         if expect_rows:
             check("{} export row count".format(fmt), job["written"], 600000)
         check("{} file is non-empty".format(fmt), job["size"] > 0, True)
+
+    extract_checks(call, con, src, did)
+    union_checks(call, con, src)
 
     print("\n{} passed, {} failed".format(passed, failed))
     return 1 if failed else 0
