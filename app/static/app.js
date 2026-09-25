@@ -31,7 +31,6 @@ const state = {
   pollTimer: null,
   reqToken: 0,
   pivot: newPivotState(),
-  diff: newDiffState(),
 };
 
 /* Rows and Columns hold plain column names; Values holds { column, agg }. */
@@ -409,7 +408,6 @@ function mountDataset(dataset) {
   state.page = 0;
   state.matched = dataset.row_count;
   state.pivot = newPivotState();
-  state.diff = newDiffState();
   syncPivotOptions();
 
   $('welcome').hidden = true;
@@ -454,39 +452,11 @@ function unmountDataset() {
 
 /* ─────────────────────────── columns rail ─────────────────────────── */
 
-/* The rail does two jobs, one per view. In Data and Pivot it decides what the
-   grid shows; in Difference it *is* the column picker for the run, because the
-   list of columns already lives here and asking someone to re-read seventy names
-   in a second box below the table was the worst thing about the old tab. */
-
-const railIsPicking = () => state.mode === 'diff';
-
-/* Everything the analysis could check: the key groups the rows, so it is the one
-   column that cannot also be one of the columns compared across them. */
-function pickableColumns() {
-  if (!state.dataset) return [];
-  // Neither role can also be one of the columns compared: the key groups the
-  // rows, and checking the explanatory column against itself is tautological
-  // — it always "explains" its own variation, so it never fails and never
-  // tells a reviewer anything. The server enforces this too; excluding it
-  // here keeps the rail's tick boxes from ever claiming otherwise.
-  return state.dataset.columns.filter((c) =>
-    c.name !== state.diff.key && c.name !== state.diff.explain);
-}
-
 function renderRail() {
   const list = $('column-list');
   list.innerHTML = '';
   const needle = state.columnFilter.toLowerCase();
-  const picking = railIsPicking();
-  const diff = state.diff;
-
-  $('rail-title-text').textContent = picking ? 'Columns to check' : 'Columns';
-  $('rail-tools-data').hidden = picking;
-  $('rail-tools-diff').hidden = !picking;
-  $('column-count').textContent = picking
-    ? `${diff.include.size} of ${pickableColumns().length}`
-    : state.dataset.columns.length;
+  $('column-count').textContent = state.dataset.columns.length;
 
   for (const column of state.dataset.columns) {
     if (needle && !column.name.toLowerCase().includes(needle)) continue;
@@ -494,25 +464,16 @@ function renderRail() {
     const item = el('li', 'col-item');
     const isHidden = state.hidden.has(column.name);
     const isFiltered = Boolean(state.filters[column.name]);
-    const isKey = picking && column.name === diff.key;
-    const isExplain = picking && !!diff.explain && column.name === diff.explain;
-    const isPicked = picking && diff.include.has(column.name);
     if (isFiltered) item.classList.add('filtered');
-    if (!picking && isHidden) item.classList.add('hidden-col');
-    if (picking) item.classList.add('picking');
-    if (isPicked) item.classList.add('picked');
-    if (isKey) item.classList.add('is-role');
+    if (isHidden) item.classList.add('hidden-col');
 
     const badge = el('span', 'type-badge', TYPE_ABBR[column.category] || '?');
     badge.dataset.cat = column.category;
     badge.title = column.type;
 
     const body = el('div', 'col-body');
-    const nameRow = el('div', 'col-name', column.name);
-    if (isKey) nameRow.appendChild(el('span', 'role-tag key', 'KEY'));
-    else if (isExplain) nameRow.appendChild(el('span', 'role-tag explains', 'EXPLAINS'));
-    body.appendChild(nameRow);
-    // Extraction is a Data view setting; Pivot and Difference read raw values.
+    body.appendChild(el('div', 'col-name', column.name));
+    // Extraction is a Data view setting; the Pivot reads raw values.
     let shownType = state.mode === 'data' ? typeLabel(column.name, column.type) : column.type;
     // Point out the text columns that hold dates, since that is not obvious.
     if (state.mode === 'data' && shownType === column.type && isTextDate(column)) shownType += ' · dates';
@@ -530,44 +491,20 @@ function renderRail() {
     };
     actions.appendChild(filterBtn);
 
-    if (!picking) {
-      const eyeBtn = el('button', 'icon-btn', isHidden ? '𝅘' : '◉');
-      eyeBtn.title = isHidden ? 'Show column' : 'Hide column from preview and export';
-      eyeBtn.onclick = (event) => {
-        event.stopPropagation();
-        if (isHidden) state.hidden.delete(column.name);
-        else state.hidden.add(column.name);
-        renderRail();
-        renderExportColumns();
-        refresh({ countUnchanged: true });
-      };
-      actions.appendChild(eyeBtn);
-    }
+    const eyeBtn = el('button', 'icon-btn', isHidden ? '𝅘' : '◉');
+    eyeBtn.title = isHidden ? 'Show column' : 'Hide column from preview and export';
+    eyeBtn.onclick = (event) => {
+      event.stopPropagation();
+      if (isHidden) state.hidden.delete(column.name);
+      else state.hidden.add(column.name);
+      renderRail();
+      renderExportColumns();
+      refresh({ countUnchanged: true });
+    };
+    actions.appendChild(eyeBtn);
 
-    if (picking) {
-      // The tick box leads, because in this view ticking is the whole point and
-      // the eye would otherwise sit where the affordance is expected.
-      const locked = isKey || isExplain;
-      const box = el('span', `pick-box${isPicked ? ' on' : ''}${locked ? ' locked' : ''}`,
-                     locked ? '—' : (isPicked ? '✓' : ''));
-      item.append(box, badge, body, actions);
-      if (isKey) {
-        item.title = `${column.name} is the key this run groups by, so it is not one of `
-          + 'the columns compared across the rows.';
-        item.onclick = () => {};
-      } else if (isExplain) {
-        item.title = `${column.name} is the explanatory column, so checking it against `
-          + 'itself would never tell you anything — it always "explains" its own variation.';
-        item.onclick = () => {};
-      } else {
-        item.title = isPicked ? `Checked — click to leave ${column.name} out`
-                              : `Click to check ${column.name}`;
-        item.onclick = () => toggleDiffColumn(column.name);
-      }
-    } else {
-      item.append(badge, body, actions);
-      item.onclick = () => openFilterPopover(column, item);
-    }
+    item.append(badge, body, actions);
+    item.onclick = () => openFilterPopover(column, item);
 
     // Rail columns are drag sources for the pivot wells.
     item.draggable = true;
@@ -1217,7 +1154,9 @@ function opsFor(category) {
 function parseValueList(text) {
   const out = [];
   const seen = new Set();
-  const pattern = /"((?:[^"]|"")*)"|([^,\t\r\n]+)/g;
+  // A quoted value may have spaces around it ("a, "b, c"") but must end at a
+  // separator; anything else is read as plain text, quotes and all.
+  const pattern = /[ ]*"((?:[^"]|"")*)"[ ]*(?=[,\t\r\n]|$)|([^,\t\r\n]+)/g;
   let match;
   while ((match = pattern.exec(String(text ?? ''))) !== null) {
     const value = (match[1] !== undefined ? match[1].replace(/""/g, '"') : match[2]).trim();
@@ -1353,7 +1292,7 @@ function applyFilter() {
   const column = pop.column;
   draft.column = column.name;
   // A filter on an extracted part says so, so it means "year = 2024" wherever
-  // it is read -- the Pivot and Difference tabs included.
+  // it is read -- the Pivot tab included.
   if (column.transform) draft.transform = column.transform;
   else delete draft.transform;
   if (column.transform && column.dateFormat) draft.date_format = column.dateFormat;
@@ -1468,27 +1407,16 @@ function isPivotExport() {
   return state.mode === 'pivot' && !pivotIsEmpty();
 }
 
-function isDiffExport() {
-  return state.mode === 'diff' && !!state.diff.jobId && state.diff.results.length > 0;
-}
-
 function openDrawer() {
   const pivotMode = isPivotExport();
-  const diffMode = isDiffExport();
-  $('drawer-title').textContent = diffMode ? 'Export the difference analysis'
-    : (pivotMode ? 'Export pivot to Excel' : 'Export filtered data');
+  $('drawer-title').textContent = pivotMode ? 'Export pivot to Excel' : 'Export filtered data';
   // A pivot is always an .xlsx of exactly the table on screen: no format
-  // choice, no row limit, and the columns come from the Values well. The
-  // analysis keeps the format choice -- Excel for the full workbook, CSV for
-  // the summary alone -- but nothing else applies to it either.
+  // choice, no row limit, and the columns come from the Values well.
   $('field-format').hidden = pivotMode;
-  $('field-limit').hidden = pivotMode || diffMode;
-  $('field-columns').hidden = pivotMode || diffMode;
-  setDiffFormatOptions(diffMode);
-  $('export-sheet').value = diffMode ? 'Difference analysis'
-    : (pivotMode ? 'Pivot' : ($('export-sheet').value || 'Data'));
-  $('btn-start-export').textContent = diffMode ? 'Export analysis'
-    : (pivotMode ? 'Export pivot' : 'Start export');
+  $('field-limit').hidden = pivotMode;
+  $('field-columns').hidden = pivotMode;
+  $('export-sheet').value = pivotMode ? 'Pivot' : ($('export-sheet').value || 'Data');
+  $('btn-start-export').textContent = pivotMode ? 'Export pivot' : 'Start export';
   $('progress-block').hidden = true;
 
   renderExportSummary();
@@ -1508,10 +1436,6 @@ function renderExportSummary() {
   if (!node || !state.dataset) return;
   node.innerHTML = '';
 
-  if (isDiffExport()) {
-    renderDiffExportSummary(node);
-    return;
-  }
   if (isPivotExport()) {
     renderPivotExportSummary(node);
     return;
@@ -1540,42 +1464,6 @@ function renderExportSummary() {
   node.appendChild(matchRow);
   updateExcelNotice();
 }
-
-function renderDiffExportSummary(node) {
-  const diff = state.diff;
-  const counts = {};
-  for (const record of diff.results) counts[record.verdict] = (counts[record.verdict] || 0) + 1;
-  const rows = [
-    ['Source', state.dataset.name],
-    ['Grouped by', diff.key],
-    ['Explained by', diff.explain || 'nothing — differences are not attributed'],
-    [`${diff.key} values analysed`, diff.plan ? fmtNum(diff.plan.assets) : '—'],
-    ['Coverage', diff.sample ? `${fmtNum(diff.sample)} sampled` : 'every row'],
-  ];
-  for (const [label, value] of rows) {
-    const row = el('div', 'summary-row');
-    row.append(el('span', null, label), el('span', null, value));
-    node.appendChild(row);
-  }
-  const emph = el('div', 'summary-row emph');
-  emph.append(el('span', null, 'Columns analysed'), el('span', null, fmtNum(diff.results.length)));
-  node.appendChild(emph);
-
-  const differing = VERDICTS_NEEDING_A_RULE.reduce((n, v) => n + (counts[v] || 0), 0);
-  if (differing) {
-    const note = el('div', 'notice',
-      `${fmtNum(differing)} column${differing === 1 ? ' differs' : 's differ'} across the rows `
-      + `sharing a ${diff.key}. The Examples sheet carries ${DIFF_EXPORT_EXAMPLES} real `
-      + `${diff.key} values for each of them, with every one of their rows, so the verdict `
-      + `can be checked without going back to the file.`);
-    note.hidden = false;
-    node.appendChild(note);
-  }
-}
-
-/* Kept in step with exporter.DIFF_EXPORT_EXAMPLE_ASSETS — the drawer promises
-   what the workbook delivers. */
-const DIFF_EXPORT_EXAMPLES = 10;
 
 function renderPivotExportSummary(node) {
   const pivotState = state.pivot;
@@ -1626,7 +1514,7 @@ function updateExcelNotice() {
   if (!notice) return;
   const limit = 1048575;
   const rows = state.matched;
-  if (isPivotExport() || isDiffExport()) {
+  if (isPivotExport()) {
     notice.hidden = true;
     return;
   }
@@ -1641,19 +1529,6 @@ function updateExcelNotice() {
   }
 }
 
-/* The analysis writes a workbook or a summary CSV; the other two formats mean
-   nothing for it, so they leave the list rather than failing on the server. */
-function setDiffFormatOptions(diffMode) {
-  const select = $('export-format');
-  for (const option of select.options) {
-    option.hidden = diffMode && !['xlsx', 'csv'].includes(option.value);
-  }
-  if (diffMode && !['xlsx', 'csv'].includes(select.value)) select.value = 'xlsx';
-  select.options[1].textContent = diffMode
-    ? 'CSV (.csv) — the summary table only, no examples'
-    : 'CSV (.csv) — fastest for huge results';
-}
-
 function syncFormatFields() {
   const isExcel = isPivotExport() || $('export-format').value === 'xlsx';
   $('excel-only').style.display = isExcel ? '' : 'none';
@@ -1662,13 +1537,8 @@ function syncFormatFields() {
 
 async function startExport() {
   const pivotMode = isPivotExport();
-  const diffMode = isDiffExport();
   const limitRaw = $('export-limit').value;
-  const payload = diffMode ? {
-    format: $('export-format').value,
-    include_manifest: $('export-manifest').checked,
-    sheet_name: $('export-sheet').value.trim() || 'Difference analysis',
-  } : pivotMode ? {
+  const payload = pivotMode ? {
     ...pivotPayload(),
     sheet_name: $('export-sheet').value.trim() || 'Pivot',
     include_manifest: $('export-manifest').checked,
@@ -1694,8 +1564,7 @@ async function startExport() {
   $('progress-detail').textContent = '';
 
   try {
-    const endpoint = diffMode ? `/api/diff/export/${state.diff.jobId}`
-      : (pivotMode ? '/api/pivot/export' : '/api/export');
+    const endpoint = pivotMode ? '/api/pivot/export' : '/api/export';
     const job = await api(endpoint, payload);
     state.exportJob = job;
     pollExport(job.id);
@@ -1993,11 +1862,11 @@ function setMode(mode) {
   refresh({ countUnchanged: state.matched !== null });
 }
 
-const EXPORT_LABELS = { pivot: 'Export pivot', diff: 'Export analysis', data: 'Export' };
+const EXPORT_LABELS = { pivot: 'Export pivot', data: 'Export' };
 
 function applyMode(mode) {
   state.mode = mode;
-  for (const name of ['data', 'pivot', 'diff']) {
+  for (const name of ['data', 'pivot']) {
     $(`tab-${name}`).classList.toggle('active', mode === name);
     $(`${name}-view`).hidden = mode !== name;
   }
@@ -2006,14 +1875,7 @@ function applyMode(mode) {
     loadAggregations().then(renderWells);
     renderWells();
   }
-  if (mode === 'diff') {
-    // Building the setup panel is all that happens on arrival: the analysis is
-    // minutes of work, so it waits to be asked for.
-    loadDiffDefaults().then(() => { buildDiffConfig(); renderRail(); });
-    buildDiffConfig();
-  }
-  // The rail is the column picker in Difference and the visibility switch
-  // everywhere else, so every change of view redraws it.
+  // Extracted columns are labelled in the Data view only, so the rail follows the view.
   if (state.dataset) renderRail();
 }
 
@@ -2721,7 +2583,6 @@ function wire() {
   $('pop-clear').onclick = clearCurrentFilter;
 
   wirePivot();
-  wireDiff();
   $('btn-export').onclick = openDrawer;
   $('drawer-close').onclick = closeDrawer;
   $('scrim').onclick = closeDrawer;
@@ -2757,905 +2618,3 @@ function wire() {
 }
 
 wire();
-
-/* ═══════════════════════ difference analysis ═══════════════════════ */
-
-/* One run's worth of state. `results` grows while the job is still going, which
-   is what lets the table fill in column by column instead of after five minutes
-   of a blank screen.
-
-   `include` is the reviewer's ticked set and starts empty: a run over seventy
-   columns of an eleven-gigabyte extract is minutes of work, and nobody wants
-   sixty-four answers they never asked for. Picking in is the cheap direction --
-   you name the six columns you care about, rather than un-naming the rest. */
-function newDiffState() {
-  return {
-    jobId: null,
-    status: null,
-    results: [],
-    plan: null,
-    key: null,
-    explain: null,
-    include: new Set(),
-    skipBlank: true,
-    useFilters: false,
-    sample: 10000,
-    setupOpen: true,
-    verdictFilter: null,
-    sort: { by: 'verdict', desc: true },
-    search: '',
-    selected: null,
-    examples: null,
-    exampleOffset: 0,
-    assetJump: '',
-    pollTimer: null,
-    built: false,
-  };
-}
-
-const VERDICT_LABELS = {
-  ALL_BLANK: 'All blank',
-  CONSTANT: 'Constant',
-  SPARSE_SINGLE_VALUE: 'Sparse',
-  TRUE_DIFF_BY_DEPR_AREA: 'Differs by area',
-  TRUE_DIFF_OTHER: 'Unexplained',
-  ERROR: 'Error',
-};
-/* What each verdict means for the person reading it, in one line. Shown under
-   the chips and in the drill-down, so the vocabulary is never a guess. */
-const VERDICT_BLURBS = {
-  CONSTANT: 'Every row of a key already agrees.',
-  SPARSE_SINGLE_VALUE: 'One value plus blanks — the rows fill each other in.',
-  ALL_BLANK: 'Nothing recorded anywhere.',
-  TRUE_DIFF_BY_DEPR_AREA: 'Values differ, but never inside one area.',
-  TRUE_DIFF_OTHER: 'Values differ in a way nothing here explains.',
-  ERROR: 'The column could not be analysed.',
-};
-/* Read order, worst last: the unexplained pile is what the tab exists for. The
-   table sorts this descending by default so that pile lands at the top, where
-   the eye starts. */
-const VERDICT_ORDER = ['CONSTANT', 'SPARSE_SINGLE_VALUE', 'ALL_BLANK',
-                       'TRUE_DIFF_BY_DEPR_AREA', 'TRUE_DIFF_OTHER', 'ERROR'];
-/* The two verdicts that end with a person having to decide something. */
-const VERDICTS_NEEDING_A_RULE = ['TRUE_DIFF_OTHER', 'TRUE_DIFF_BY_DEPR_AREA'];
-
-let DIFF_DEFAULTS = null;
-
-const examplePageSize = () =>
-  (DIFF_DEFAULTS && DIFF_DEFAULTS.example_page_size) || 10;
-
-function loadDiffDefaults() {
-  if (DIFF_DEFAULTS) return Promise.resolve(DIFF_DEFAULTS);
-  return api('/api/diff/defaults', undefined, 'GET')
-    .then((data) => { DIFF_DEFAULTS = data; return data; })
-    .catch(() => ({ excluded_columns: [], example_page_size: 10 }));
-}
-
-/* -- setup -- */
-
-function buildDiffConfig() {
-  const diff = state.diff;
-  if (diff.built || !state.dataset) return;
-  const columns = state.dataset.columns.filter((c) => c.category !== 'complex');
-
-  const keySelect = $('diff-key');
-  const explainSelect = $('diff-explain');
-  keySelect.innerHTML = '';
-  explainSelect.innerHTML = '';
-  explainSelect.appendChild(el('option', null, 'Nothing — do not attribute differences'));
-  explainSelect.lastChild.value = '';
-  for (const column of columns) {
-    for (const select of [keySelect, explainSelect]) {
-      const option = el('option', null, column.name);
-      option.value = column.name;
-      select.appendChild(option);
-    }
-  }
-  // A best guess only — the point of the selects is that it is a guess.
-  const guess = (needles) => (columns.find(
-    (c) => needles.some((n) => c.name.toLowerCase().includes(n))) || {}).name;
-  diff.key = guess(['asset_id', 'assetid', 'asset']) || (columns[0] || {}).name || null;
-  diff.explain = guess(['depr', 'area']) || '';
-  if (diff.explain === diff.key) diff.explain = '';
-  keySelect.value = diff.key || '';
-  explainSelect.value = diff.explain || '';
-
-  // Nothing is checked to begin with, by design.
-  diff.include = new Set();
-  diff.built = true;
-  setDiffSetupOpen(true);
-  renderDiffPicks();
-}
-
-/* The columns the business already knows are worth checking: everything except
-   the run metadata and the period amounts that are *meant* to vary per area. */
-function suggestedDiffColumns() {
-  const known = new Set(DIFF_DEFAULTS ? DIFF_DEFAULTS.excluded_columns : []);
-  return pickableColumns()
-    .filter((c) => !known.has(c.name) && c.name !== state.diff.explain)
-    .map((c) => c.name);
-}
-
-function toggleDiffColumn(name) {
-  const diff = state.diff;
-  if (name === diff.key || name === diff.explain) return;
-  if (diff.include.has(name)) diff.include.delete(name);
-  else diff.include.add(name);
-  renderRail();
-  renderDiffPicks();
-}
-
-function setDiffColumns(names) {
-  state.diff.include = new Set(names);
-  renderRail();
-  renderDiffPicks();
-}
-
-/* Setup collapses once an answer exists: the question stops being the most
-   interesting thing on screen the moment the results land, and a 200px config
-   panel above a table the reviewer is trying to read is pure cost. */
-function setDiffSetupOpen(open) {
-  state.diff.setupOpen = open;
-  $('diff-setup-body').hidden = !open;
-  $('diff-setup').classList.toggle('collapsed', !open);
-  $('diff-setup-toggle').setAttribute('aria-expanded', String(open));
-  $('diff-setup-caret').textContent = open ? '▾' : '▸';
-  $('diff-setup-edit').textContent = open ? 'Hide' : 'Change';
-  renderDiffRecap();
-}
-
-function renderDiffRecap() {
-  const diff = state.diff;
-  const node = $('diff-setup-recap');
-  if (!diff.key) { node.textContent = 'Choose a key, then tick the columns to check.'; return; }
-  const bits = [
-    `one row per ${diff.key}`,
-    diff.explain ? `explained by ${diff.explain}` : 'differences not attributed',
-    `${fmtNum(diff.include.size)} column${diff.include.size === 1 ? '' : 's'} checked`,
-    diff.sample ? `${fmtNum(diff.sample)} assets` : 'every asset',
-  ];
-  if (diff.useFilters && activeFilters().length) bits.push('filtered rows only');
-  node.textContent = bits.join(' · ');
-}
-
-/* The tray: what is ticked, visible without scrolling the rail, and removable
-   in place. Seventy rail rows cannot answer "what did I pick?" at a glance. */
-function renderDiffPicks() {
-  const diff = state.diff;
-  const tray = $('diff-picked');
-  const total = pickableColumns().length;
-  tray.innerHTML = '';
-
-  $('diff-pick-count').textContent = diff.include.size
-    ? `${fmtNum(diff.include.size)} of ${fmtNum(total)}`
-    : 'none yet';
-  $('diff-pick-count').classList.toggle('empty', !diff.include.size);
-
-  if (!diff.include.size) {
-    tray.appendChild(el('span', 'tray-empty',
-      'No column is checked, so there is nothing to run yet.'));
-  } else {
-    // File order, not click order: the reviewer recognises the schema's order.
-    for (const column of state.dataset.columns) {
-      if (!diff.include.has(column.name)) continue;
-      const chip = el('span', 'picked-chip');
-      chip.append(el('span', 'pc-name', column.name));
-      const remove = el('button', 'pc-x', '×');
-      remove.title = `Leave ${column.name} out`;
-      remove.onclick = () => toggleDiffColumn(column.name);
-      chip.appendChild(remove);
-      tray.appendChild(chip);
-    }
-  }
-
-  $('btn-diff-run').disabled = !diff.include.size || !diff.key;
-  renderDiffRecap();
-  renderDiffReadout();
-}
-
-/* -- running -- */
-
-async function runDiff() {
-  const diff = state.diff;
-  if (!diff.key) { toast('Choose the column that identifies one thing.', 'error'); return; }
-  if (!diff.include.size) {
-    toast('Tick at least one column in the Columns list.', 'error');
-    return;
-  }
-
-  clearTimeout(diff.pollTimer);
-  diff.results = [];
-  diff.plan = null;
-  diff.status = null;
-  diff.selected = null;
-  diff.examples = null;
-  diff.verdictFilter = null;
-  $('diff-detail').hidden = true;
-  $('diff-findings').hidden = true;
-  $('diff-verdictbar').hidden = true;
-  $('diff-empty').hidden = true;
-  $('diff-head').innerHTML = '';
-  $('diff-body').innerHTML = '';
-  $('btn-diff-export').disabled = true;
-
-  const payload = {
-    dataset_id: state.dataset.id,
-    key_column: diff.key,
-    explain_column: diff.explain || null,
-    // The ticked set travels as an inclusion, so the manifest records the six
-    // columns the reviewer chose rather than the sixty-four they did not.
-    include: [...diff.include],
-    sample_assets: diff.sample || null,
-    exclude_all_blank: diff.skipBlank,
-    // Sending the filters *is* the opt-in: what the run covered is then exactly
-    // what the manifest records.
-    filters: diff.useFilters ? activeFilters() : [],
-  };
-
-  $('diff-progress').hidden = false;
-  $('diff-progress-fill').className = 'progress-fill indeterminate';
-  $('diff-progress-fill').style.width = '100%';
-  $('diff-progress-label').textContent = 'Sizing the run…';
-  $('diff-progress-detail').textContent = '';
-  $('btn-diff-run').disabled = true;
-  $('btn-diff-cancel').hidden = false;
-
-  try {
-    const job = await api('/api/diff/start', payload);
-    diff.jobId = job.id;
-    pollDiff();
-  } catch (error) {
-    finishDiff('error');
-    $('diff-progress-label').textContent = error.message;
-    toast(error.message, 'error');
-  }
-}
-
-function pollDiff() {
-  const diff = state.diff;
-  clearTimeout(diff.pollTimer);
-  const tick = async () => {
-    let status;
-    try {
-      status = await api(`/api/diff/status/${diff.jobId}`, undefined, 'GET');
-    } catch (error) {
-      finishDiff('error');
-      $('diff-progress-label').textContent = error.message;
-      return;
-    }
-    diff.status = status;
-    diff.plan = status.plan;
-    diff.results = status.results || [];
-    renderDiffProgress(status);
-    renderDiffFindings();
-    renderDiffTable();
-    if (['queued', 'running'].includes(status.status)) {
-      diff.pollTimer = setTimeout(tick, 600);
-      return;
-    }
-    finishDiff(status.status);
-    if (status.status === 'error') toast(status.error || 'The analysis failed.', 'error');
-  };
-  tick();
-}
-
-function renderDiffProgress(status) {
-  const fill = $('diff-progress-fill');
-  if (status.total && status.percent !== null) {
-    fill.className = 'progress-fill';
-    fill.style.width = `${status.percent}%`;
-    $('diff-progress-label').textContent = status.current
-      ? `Analysing ${status.current}…` : 'Analysing…';
-    $('diff-progress-detail').textContent =
-      `${status.done} of ${status.total} columns · ${fmtDuration(status.elapsed)}`;
-  } else {
-    $('diff-progress-label').textContent = 'Sizing the run…';
-  }
-}
-
-function finishDiff(status) {
-  const diff = state.diff;
-  clearTimeout(diff.pollTimer);
-  $('btn-diff-run').disabled = !diff.include.size || !diff.key;
-  $('btn-diff-cancel').hidden = true;
-  const fill = $('diff-progress-fill');
-  fill.className = `progress-fill${status === 'error' ? ' error' : ' done'}`;
-  fill.style.width = '100%';
-  if (status === 'done' || status === 'cancelled') {
-    $('btn-diff-export').disabled = !diff.results.length;
-    const total = diff.status ? diff.status.total : diff.results.length;
-    $('diff-progress-label').textContent = status === 'cancelled'
-      ? `Cancelled after ${diff.results.length} of ${total} columns`
-      : `Analysed ${diff.results.length} column${diff.results.length === 1 ? '' : 's'}`;
-    $('diff-progress-detail').textContent = diff.status
-      ? fmtDuration(diff.status.elapsed) : '';
-    // Hand the screen over to the answer: collapse the setup, and fold the
-    // finished progress bar away rather than leave a full stripe above it.
-    if (diff.results.length) setDiffSetupOpen(false);
-    if (status === 'done' && diff.results.length) $('diff-progress').hidden = true;
-  }
-  renderDiffReadout();
-}
-
-async function cancelDiff() {
-  const diff = state.diff;
-  if (!diff.jobId) return;
-  try { await api(`/api/diff/cancel/${diff.jobId}`, {}); } catch (error) { /* it ends anyway */ }
-}
-
-/* -- the funnel: how far does it narrow as columns are added? -- */
-
-function renderDiffWaterfall() {
-  const node = $('diff-waterfall');
-  const plan = state.diff.plan;
-  const steps = plan && plan.waterfall;
-  if (!steps || !steps.length) { node.hidden = true; return; }
-  node.hidden = false;
-  node.innerHTML = '';
-
-  node.append(
-    el('div', 'wf-title', 'How far does it narrow?'),
-    el('div', 'wf-sub', 'One column at a time, in the order you checked them — each row '
-      + 'can only hold steady or drop from the one above it, never climb back up.'),
-  );
-
-  const list = el('div', 'wf-list');
-  for (const step of steps) {
-    const row = el('div', 'wf-row');
-    row.title = `${fmtNum(step.keys_clean)} of ${fmtNum(step.keys_total)} keys `
-      + `(${step.clean_pct == null ? '—' : step.clean_pct}%) still collapse to one row once `
-      + `${fmtNum(step.columns_so_far)} column${step.columns_so_far === 1 ? '' : 's'} `
-      + `${step.columns_so_far === 1 ? 'is' : 'are'} considered together.`;
-
-    row.append(el('span', 'wf-col', step.column));
-
-    const bar = el('div', 'wf-bar');
-    const clean = el('span', 'wf-bar-clean');
-    clean.style.width = `${step.clean_pct || 0}%`;
-    bar.appendChild(clean);
-    row.appendChild(bar);
-
-    row.append(el('span', 'wf-count', `${fmtNum(step.keys_clean)} of ${fmtNum(step.keys_total)} collapse`));
-
-    let delta;
-    if (step.dropped === null) {
-      delta = el('span', 'wf-delta neutral', 'starting point');
-    } else if (step.dropped > 0) {
-      delta = el('span', 'wf-delta bad', `−${fmtNum(step.dropped)} because of this column`);
-    } else {
-      delta = el('span', 'wf-delta ok', 'no change');
-    }
-    row.appendChild(delta);
-
-    if (step.keys_clean === 0 && (step.dropped || 0) > 0) row.classList.add('wf-row-zero');
-    list.appendChild(row);
-  }
-  node.appendChild(list);
-}
-
-/* -- run-level findings -- */
-
-function renderDiffFindings() {
-  const node = $('diff-findings');
-  const plan = state.diff.plan;
-  if (!plan) { node.hidden = true; return; }
-  node.innerHTML = '';
-  node.hidden = false;
-
-  const finding = (kind, mark, html) => {
-    const row = el('div', `finding ${kind}`);
-    row.append(el('span', 'finding-mark', mark));
-    const text = el('div', 'finding-text');
-    text.innerHTML = html;
-    row.appendChild(text);
-    node.appendChild(row);
-  };
-
-  // Headline first: does a key collapse to one record once every checked
-  // column is considered *together*, not one at a time? A column can look
-  // fine on its own and the row still not collapse — this is the number that
-  // actually answers "is there work here?"
-  const record = plan.record_consistency || {};
-  if (record.checked) {
-    if (!record.keys_conflicting) {
-      finding('good', '✓', `<b>Every key collapses to a single record.</b> `
-        + `All ${fmtNum(record.keys_total)} values of <b>${state.diff.key}</b> agree on all `
-        + `${fmtNum(record.columns_considered)} checked column${record.columns_considered === 1 ? '' : 's'} `
-        + `at once — safe to collapse to one row per key with nothing lost.`);
-    } else {
-      finding('warn', '⚠', `<b>${fmtNum(record.keys_conflicting)} of ${fmtNum(record.keys_total)} keys `
-        + `(${record.conflicting_pct}%) hold a real conflict</b> once every checked column is `
-        + `considered together — that can happen even when each column looks fine on its own. `
-        + `${fmtNum(record.keys_clean)} collapse cleanly. The table below shows which columns are `
-        + `behind it.`);
-    }
-  }
-
-  const grain = plan.duplicate_grain || {};
-  if (grain.checked && !grain.unique) {
-    // Surfaced on its own because it changes what an unexplained difference
-    // means — it may be duplicate rows rather than conflicting data.
-    finding('warn', '⚠', `<b>The grain is not one row per (${state.diff.key}, ${grain.column}).</b> `
-      + `${fmtNum(grain.duplicate_pairs)} pair${grain.duplicate_pairs === 1 ? '' : 's'} appear on `
-      + `more than one row (${fmtNum(grain.extra_rows)} extra row${grain.extra_rows === 1 ? '' : 's'}, `
-      + `worst case ${grain.max_rows_per_pair} rows for one pair). Read “Unexplained” below with `
-      + `that in mind: some of it may be duplicate rows rather than conflicting data.`);
-  } else if (grain.checked) {
-    finding('good', '✓', `<b>One row per (${state.diff.key}, ${grain.column}).</b> `
-      + `The extract is at the grain the analysis assumes, so an unexplained difference `
-      + `is a real disagreement between rows.`);
-  }
-
-  const sampled = state.diff.sample;
-  const blank = (plan.all_blank_columns || []).length;
-  // Blank columns are only "set aside" when the run was told to set them aside;
-  // otherwise they are results with an ALL_BLANK verdict, and saying they were
-  // excluded would contradict the table right below.
-  const blankNote = !blank ? ''
-    : (state.diff.skipBlank
-        ? ` · <b>${fmtNum(blank)}</b> of them set aside as blank in every row`
-        : ` · <b>${fmtNum(blank)}</b> blank in every row`);
-  finding('', 'ⓘ', `<b>${fmtNum(plan.assets)} ${sampled ? 'sampled ' : ''}assets</b> across `
-    + `${fmtNum(plan.rows)} rows · <b>${fmtNum((plan.columns || []).length)}</b> of the columns `
-    + `you checked reached a verdict` + blankNote
-    + (state.diff.status && state.diff.status.status === 'done'
-        ? ` · analysed in ${fmtDuration(state.diff.status.elapsed)}` : '')
-    + (sampled ? ` · <b>sample mode</b> — figures are an estimate, not the final answer.` : '.'));
-}
-
-/* -- the answer, headline first -- */
-
-function verdictCounts() {
-  const counts = {};
-  for (const record of state.diff.results) {
-    counts[record.verdict] = (counts[record.verdict] || 0) + 1;
-  }
-  return counts;
-}
-
-/* The bar above the table: one sentence saying what the run found, then a
-   proportional track and the chips that filter it. A reviewer should be able to
-   answer "is there work here?" without reading a single table row. */
-function renderDiffVerdictBar() {
-  const diff = state.diff;
-  const bar = $('diff-verdictbar');
-  bar.hidden = !diff.results.length;
-  if (!diff.results.length) return;
-
-  const counts = verdictCounts();
-  const needsRule = VERDICTS_NEEDING_A_RULE.reduce((n, v) => n + (counts[v] || 0), 0);
-  const unexplained = counts.TRUE_DIFF_OTHER || 0;
-  const total = diff.results.length;
-  const record = (diff.plan && diff.plan.record_consistency) || {};
-
-  const headline = $('diff-headline');
-  headline.innerHTML = '';
-  if (record.checked) {
-    // Lead with the record-level question — can a key collapse to one row,
-    // *everything* considered at once? — and let the per-column breakdown
-    // below explain why, rather than the other way round.
-    if (!record.keys_conflicting) {
-      headline.append(el('b', 'ok', `All ${fmtNum(record.keys_total)} keys collapse to a single record.`),
-        el('span', 'hl-sub', ' Nothing here needs a business rule.'));
-    } else {
-      headline.append(
-        el('b', 'bad', `${fmtNum(record.keys_conflicting)} of ${fmtNum(record.keys_total)} keys `
-          + `(${record.conflicting_pct}%) hold a real conflict`),
-        el('span', 'hl-sub', ` once all ${fmtNum(record.columns_considered)} checked columns are `
-          + `considered together — ` + (needsRule
-              ? `${fmtNum(needsRule)} of them, below, need a business rule.`
-              : `see the columns below.`)));
-    }
-  } else if (!needsRule) {
-    headline.append(el('b', 'ok', `All ${fmtNum(total)} columns can be collapsed mechanically.`),
-      el('span', 'hl-sub', ' Nothing here needs a business rule.'));
-  } else {
-    headline.append(
-      el('b', unexplained ? 'bad' : 'warn',
-         `${fmtNum(needsRule)} of ${fmtNum(total)} column${total === 1 ? '' : 's'} need a business rule`),
-      el('span', 'hl-sub', unexplained
-        ? ` — ${fmtNum(unexplained)} of them ${unexplained === 1 ? 'varies' : 'vary'} in a way `
-          + `${diff.explain || 'nothing here'} does not explain.`
-        : ` — every one of them is explained by ${diff.explain}.`));
-  }
-
-  const track = $('diff-vb-track');
-  track.innerHTML = '';
-  for (const verdict of VERDICT_ORDER) {
-    const count = counts[verdict] || 0;
-    if (!count) continue;
-    const seg = el('button', `vb-seg vd-${verdict}`);
-    seg.style.flexGrow = String(count);
-    seg.title = `${count} ${VERDICT_LABELS[verdict].toLowerCase()} — ${VERDICT_BLURBS[verdict]}`;
-    if (diff.verdictFilter && diff.verdictFilter !== verdict) seg.classList.add('muted');
-    seg.onclick = () => {
-      diff.verdictFilter = diff.verdictFilter === verdict ? null : verdict;
-      renderDiffTable();
-    };
-    if (count / total > 0.09) seg.appendChild(el('span', 'vb-seg-n', String(count)));
-    track.appendChild(seg);
-  }
-
-  renderDiffChips(counts);
-}
-
-/* -- the results table -- */
-
-/* Four percentage columns and a distinct-value count were five numbers standing
-   in for one question: how much of this column disagrees? The split bar answers
-   it at a glance and carries the exact counts in its tooltip, which leaves the
-   row wide enough for the recommendation — the thing anyone actually acts on. */
-const DIFF_COLUMNS = [
-  { key: 'column', label: 'Column', sort: 'column' },
-  { key: 'verdict', label: 'Verdict', sort: 'verdict' },
-  { key: 'split', label: 'How the keys split', sort: 'differing_pct' },
-  { key: 'differing', label: 'Keys that disagree', sort: 'differing', num: true },
-  { key: 'recommendation', label: 'What to do when collapsing' },
-];
-
-function visibleDiffRows() {
-  const diff = state.diff;
-  const needle = diff.search.trim().toLowerCase();
-  let rows = diff.results.filter((r) =>
-    (!diff.verdictFilter || r.verdict === diff.verdictFilter)
-    && (!needle || r.column.toLowerCase().includes(needle)));
-  const { by, desc } = diff.sort;
-  rows = rows.slice().sort((a, b) => {
-    let x = a[by];
-    let y = b[by];
-    if (by === 'verdict') { x = VERDICT_ORDER.indexOf(x); y = VERDICT_ORDER.indexOf(y); }
-    if (x === null || x === undefined) x = -1;
-    if (y === null || y === undefined) y = -1;
-    if (x < y) return desc ? 1 : -1;
-    if (x > y) return desc ? -1 : 1;
-    // Within one verdict the widest problem is the one to look at first.
-    if (by === 'verdict' && (b.differing || 0) !== (a.differing || 0)) {
-      return (b.differing || 0) - (a.differing || 0);
-    }
-    return a.column.localeCompare(b.column);
-  });
-  return rows;
-}
-
-/* The four buckets as one proportional bar. Colours match the verdict dots, so
-   a row whose bar is mostly red reads the same way as its red tag. */
-const SPLIT_PARTS = [
-  ['constant', 'agree'],
-  ['sparse', 'one value plus blanks'],
-  ['differing', 'disagree'],
-  ['blank', 'blank'],
-];
-
-function splitBar(record) {
-  const wrap = el('div', 'split-bar');
-  const total = record.assets || 0;
-  if (!total) {
-    wrap.appendChild(el('span', 'split-none', '—'));
-    return wrap;
-  }
-  const parts = [];
-  for (const [key, word] of SPLIT_PARTS) {
-    const count = record[key] || 0;
-    if (!count) continue;
-    const seg = el('span', `split-seg sp-${key}`);
-    seg.style.flexGrow = String(count);
-    wrap.appendChild(seg);
-    parts.push(`${nf.format(count)} ${word}`);
-  }
-  wrap.title = `${nf.format(total)} keys: ${parts.join(' · ')}`;
-  return wrap;
-}
-
-function renderDiffTable() {
-  const head = $('diff-head');
-  const body = $('diff-body');
-  const diff = state.diff;
-  renderDiffWaterfall();
-  renderDiffVerdictBar();
-  $('diff-empty').hidden = diff.results.length > 0;
-
-  head.innerHTML = '';
-  const tr = el('tr');
-  for (const spec of DIFF_COLUMNS) {
-    const th = el('th', spec.sort ? 'sortable' : null, spec.label);
-    if (spec.sort) {
-      th.onclick = () => {
-        diff.sort = { by: spec.sort, desc: diff.sort.by === spec.sort ? !diff.sort.desc : true };
-        renderDiffTable();
-      };
-      if (diff.sort.by === spec.sort) th.appendChild(el('span', 'th-sort', diff.sort.desc ? ' ▼' : ' ▲'));
-    }
-    tr.appendChild(th);
-  }
-  head.appendChild(tr);
-
-  body.innerHTML = '';
-  for (const record of visibleDiffRows()) {
-    const row = el('tr', record.column === diff.selected ? 'selected' : null);
-    row.onclick = () => openDiffColumn(record.column);
-    row.title = 'Open the example rows behind this verdict';
-    for (const spec of DIFF_COLUMNS) {
-      if (spec.key === 'verdict') {
-        const td = el('td');
-        td.appendChild(verdictTag(record.verdict));
-        row.appendChild(td);
-      } else if (spec.key === 'column') {
-        row.appendChild(el('td', 'col-name', record.column));
-      } else if (spec.key === 'split') {
-        const td = el('td', 'split');
-        td.appendChild(splitBar(record));
-        row.appendChild(td);
-      } else if (spec.key === 'differing') {
-        const td = el('td', 'num');
-        const count = record.differing || 0;
-        td.appendChild(el('span', 'diff-count', count ? fmtNum(count) : '—'));
-        if (count && record.differing_pct !== null && record.differing_pct !== undefined) {
-          td.appendChild(el('span', 'diff-share', `${record.differing_pct.toFixed(1)}%`));
-        }
-        if (!count) td.classList.add('blank');
-        row.appendChild(td);
-      } else if (spec.key === 'recommendation') {
-        const td = el('td', 'rec', record.error || record.recommendation);
-        td.appendChild(el('span', 'rec-go', '›'));
-        row.appendChild(td);
-      }
-    }
-    body.appendChild(row);
-  }
-  renderDiffReadout();
-}
-
-function verdictTag(verdict) {
-  const tag = el('span', `verdict-tag vt-${verdict}`);
-  tag.append(el('span', `vt-dot vd-${verdict}`), document.createTextNode(
-    VERDICT_LABELS[verdict] || verdict));
-  tag.title = VERDICT_BLURBS[verdict] || '';
-  return tag;
-}
-
-function renderDiffChips(counts) {
-  const node = $('diff-filter-chips');
-  const diff = state.diff;
-  node.innerHTML = '';
-
-  const chip = (verdict, label, count) => {
-    const item = el('div', 'verdict-chip');
-    if (diff.verdictFilter === verdict) item.classList.add('active');
-    else if (diff.verdictFilter) item.classList.add('muted');
-    if (verdict) item.appendChild(el('span', `vc-dot vd-${verdict}`));
-    item.append(el('span', null, label), el('span', 'vc-count', fmtNum(count)));
-    item.onclick = () => {
-      diff.verdictFilter = diff.verdictFilter === verdict ? null : verdict;
-      renderDiffTable();
-    };
-    item.title = verdict
-      ? `${VERDICT_BLURBS[verdict]} Click to show only these.`
-      : 'Show every column';
-    node.appendChild(item);
-  };
-  chip(null, 'All', diff.results.length);
-  for (const verdict of VERDICT_ORDER) {
-    if (counts[verdict]) chip(verdict, VERDICT_LABELS[verdict], counts[verdict]);
-  }
-}
-
-function renderDiffReadout() {
-  const diff = state.diff;
-  const shown = diff.results.length ? visibleDiffRows().length : 0;
-  $('diff-status-left').textContent = diff.results.length
-    ? `${fmtNum(shown)} of ${fmtNum(diff.results.length)} columns shown`
-    : (state.dataset
-        ? `${fmtNum(diff.include.size)} of ${fmtNum(pickableColumns().length)} columns checked`
-        : '');
-  const unexplained = diff.results.filter((r) => r.verdict === 'TRUE_DIFF_OTHER').length;
-  $('diff-status-right').textContent = diff.results.length
-    ? `${fmtNum(unexplained)} column${unexplained === 1 ? ' needs' : 's need'} a business rule`
-    : (diff.include.size ? 'Ready to run' : 'Tick the columns to check');
-}
-
-/* -- drill-down -- */
-
-function openDiffColumn(column) {
-  const diff = state.diff;
-  diff.selected = column;
-  diff.exampleOffset = 0;
-  diff.assetJump = '';
-  $('diff-asset-jump').value = '';
-  $('diff-asset-jump').placeholder = `Jump to a ${diff.key} value…`;
-  $('diff-detail').hidden = false;
-  renderDiffTable();
-  loadDiffExamples();
-}
-
-/* The counts live here rather than in the table: they matter once you have
-   chosen a column to look at, and five numeric columns across seventy rows is a
-   spreadsheet, not an answer. */
-function renderDiffDetailStats(record) {
-  const node = $('diff-detail-stats');
-  node.innerHTML = '';
-  const stat = (label, value, kind) => {
-    const cell = el('div', `dd-stat${kind ? ' ' + kind : ''}`);
-    cell.title = `${value} ${label}`;
-    cell.append(el('span', 'dd-stat-n', value), el('span', 'dd-stat-l', label));
-    node.appendChild(cell);
-  };
-  stat(`${state.diff.key} values`, fmtNum(record.assets));
-  stat('agree', fmtNum(record.constant), record.constant ? 'good' : null);
-  stat('one value + blanks', fmtNum(record.sparse));
-  stat('disagree', fmtNum(record.differing), record.differing ? 'bad' : null);
-  stat('blank throughout', fmtNum(record.blank));
-  if (record.conflicting_assets !== null && record.conflicting_assets !== undefined) {
-    stat(`disagree inside one ${state.diff.explain || 'group'}`,
-         fmtNum(record.conflicting_assets),
-         record.conflicting_assets ? 'bad' : 'good');
-  }
-}
-
-async function loadDiffExamples() {
-  const diff = state.diff;
-  const record = diff.results.find((r) => r.column === diff.selected);
-  if (!record) return;
-  $('diff-detail-title').textContent = record.column;
-  const sub = $('diff-detail-sub');
-  sub.innerHTML = '';
-  sub.appendChild(verdictTag(record.verdict));
-  sub.append(document.createTextNode(' ' + (record.error || record.recommendation)));
-  renderDiffDetailStats(record);
-
-  const body = $('diff-detail-body');
-  body.innerHTML = '';
-  body.appendChild(el('div', 'example-empty', 'Loading examples…'));
-
-  const page = examplePageSize();
-  const query = new URLSearchParams({ limit: String(page), offset: String(diff.exampleOffset) });
-  if (diff.assetJump) query.set('asset_id', diff.assetJump);
-  try {
-    diff.examples = await api(
-      `/api/diff/examples/${diff.jobId}/${encodeURIComponent(record.column)}?${query}`,
-      undefined, 'GET');
-  } catch (error) {
-    body.innerHTML = '';
-    body.appendChild(el('div', 'example-empty', error.message));
-    return;
-  }
-  renderDiffExamples();
-}
-
-function renderDiffExamples() {
-  const diff = state.diff;
-  const body = $('diff-detail-body');
-  const found = diff.examples;
-  const page = examplePageSize();
-  body.innerHTML = '';
-  $('diff-ex-page').textContent = String(Math.floor(diff.exampleOffset / page) + 1);
-  $('diff-ex-prev').disabled = diff.exampleOffset === 0 || !!diff.assetJump;
-  $('diff-ex-next').disabled = !found || !found.has_more || !!diff.assetJump;
-
-  if (!found || !found.assets.length) {
-    body.appendChild(el('div', 'example-empty', diff.assetJump
-      ? `No rows for ${diff.assetJump}. Check the value, or clear the box to page through examples.`
-      : `No ${diff.key} holds more than one value here — nothing to show.`));
-    return;
-  }
-
-  body.appendChild(el('div', 'example-lede',
-    diff.assetJump ? `Every row of ${diff.assetJump}.`
-      : `${found.assets.length} example${found.assets.length === 1 ? '' : 's'}, `
-        + 'with every row behind each one.'));
-
-  for (const asset of found.assets) {
-    const block = el('div', 'example-asset');
-    const head = el('div', 'example-head');
-    head.append(el('span', 'example-id', String(asset.asset)),
-                el('span', `example-note${asset.differs ? ' differs' : ''}`, asset.differs
-                  ? `${asset.distinct_values.length} different values`
-                  : 'rows agree'));
-    block.appendChild(head);
-
-    // The distinct values on their own line: what the disagreement actually is,
-    // without reading down a column of repeated rows to work it out.
-    if (asset.differs) {
-      const values = el('div', 'example-values');
-      for (const value of asset.distinct_values) {
-        values.appendChild(el('span', 'value-chip', String(value)));
-      }
-      block.appendChild(values);
-    }
-
-    const table = el('table', 'example-table');
-    const thead = el('tr');
-    thead.append(el('th', null, found.explain_column || 'Row'), el('th', null, found.column));
-    table.appendChild(thead);
-    for (const row of asset.rows) {
-      const tr = el('tr', asset.differs ? 'differs' : null);
-      tr.appendChild(el('td', 'area', row.area === null ? '—' : String(row.area)));
-      const td = el('td', 'val');
-      if (row.blank) { td.classList.add('blank'); td.textContent = '(blank)'; }
-      else td.textContent = String(row.value);
-      tr.appendChild(td);
-      table.appendChild(tr);
-    }
-    block.appendChild(table);
-    body.appendChild(block);
-  }
-}
-
-/* -- wiring -- */
-
-function wireDiff() {
-  $('tab-diff').onclick = () => setMode('diff');
-
-  $('diff-setup-toggle').onclick = () => setDiffSetupOpen(!state.diff.setupOpen);
-
-  $('diff-key').onchange = () => {
-    state.diff.key = $('diff-key').value;
-    // The key groups the rows; it cannot also be compared across them.
-    state.diff.include.delete(state.diff.key);
-    renderRail();
-    renderDiffPicks();
-  };
-  $('diff-explain').onchange = () => {
-    state.diff.explain = $('diff-explain').value;
-    // Same reasoning as the key: whatever was ticked before this was chosen
-    // as the explanatory column has to come back out, or a column picked
-    // under "All" (or ticked by hand) before this select was touched would
-    // stay checked despite comparing itself to itself.
-    state.diff.include.delete(state.diff.explain);
-    renderRail();
-    renderDiffPicks();
-    renderDiffRecap();
-  };
-  $('diff-sample').onchange = () => {
-    state.diff.sample = parseInt($('diff-sample').value, 10) || null;
-    renderDiffRecap();
-  };
-  $('diff-skip-blank').onchange = () => { state.diff.skipBlank = $('diff-skip-blank').checked; };
-  $('diff-use-filters').onchange = () => {
-    state.diff.useFilters = $('diff-use-filters').checked;
-    renderDiffRecap();
-  };
-
-  // The same three shortcuts sit in the rail and in the setup step, because the
-  // reviewer's eye is in one place or the other and neither should send them
-  // hunting for the other.
-  const pickAll = () => setDiffColumns(pickableColumns().map((c) => c.name));
-  const pickNone = () => setDiffColumns([]);
-  const pickSuggested = () => setDiffColumns(suggestedDiffColumns());
-  for (const [id, fn] of [['diff-pick-all', pickAll], ['btn-rail-all', pickAll],
-                          ['diff-pick-none', pickNone], ['btn-rail-none', pickNone],
-                          ['diff-pick-suggested', pickSuggested],
-                          ['btn-rail-suggested', pickSuggested]]) {
-    $(id).onclick = fn;
-  }
-
-  $('btn-diff-run').onclick = runDiff;
-  $('btn-diff-cancel').onclick = cancelDiff;
-  $('btn-diff-export').onclick = openDrawer;
-
-  $('diff-search').oninput = () => {
-    state.diff.search = $('diff-search').value;
-    renderDiffTable();
-  };
-  $('diff-detail-close').onclick = () => {
-    $('diff-detail').hidden = true;
-    state.diff.selected = null;
-    renderDiffTable();
-  };
-  $('diff-ex-prev').onclick = () => {
-    state.diff.exampleOffset = Math.max(0, state.diff.exampleOffset - examplePageSize());
-    loadDiffExamples();
-  };
-  $('diff-ex-next').onclick = () => {
-    state.diff.exampleOffset += examplePageSize();
-    loadDiffExamples();
-  };
-  let jumpTimer = null;
-  $('diff-asset-jump').oninput = () => {
-    clearTimeout(jumpTimer);
-    jumpTimer = setTimeout(() => {
-      state.diff.assetJump = $('diff-asset-jump').value.trim();
-      state.diff.exampleOffset = 0;
-      loadDiffExamples();
-    }, 300);
-  };
-}

@@ -6,7 +6,6 @@ come out the other side. CSV/Parquet exports skip Python entirely and use
 DuckDB's own parallel writer.
 """
 
-import csv
 import datetime as _dt
 import decimal
 import os
@@ -22,7 +21,6 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import xlsxwriter
 
-from . import diffanalysis
 from . import pivot as pivot_module
 from .engine import Engine, categorise
 from .filters import describe, format_label
@@ -32,35 +30,6 @@ EXCEL_MAX_DATA_ROWS = 1_048_575
 EXCEL_MAX_CELL_CHARS = 32_767
 # Excel cannot represent dates before 1900.
 EXCEL_MIN_DATE = _dt.date(1900, 1, 1)
-# The summary sheet, in the order a reviewer reads it: what the column is, what
-# the verdict is, then the evidence, then what to do about it.
-DIFF_SUMMARY_FIELDS = (
-    "column", "verdict", "assets", "constant", "constant_pct", "sparse", "sparse_pct",
-    "differing", "differing_pct", "blank", "blank_pct", "max_distinct",
-    "conflicting_assets", "error", "recommendation",
-)
-DIFF_SUMMARY_HEADERS = (
-    "Column", "Verdict", "Assets", "Constant", "Constant %", "Sparse", "Sparse %",
-    "Differing", "Differing %", "Blank", "Blank %", "Max distinct",
-    "Assets conflicting within an area", "Error", "Recommendation",
-)
-# Verdict -> the key of the format that colours it.
-DIFF_VERDICT_FORMATS = {
-    diffanalysis.CONSTANT: "v_constant",
-    diffanalysis.SPARSE_SINGLE_VALUE: "v_sparse",
-    diffanalysis.TRUE_DIFF_BY_DEPR_AREA: "v_explained",
-    diffanalysis.TRUE_DIFF_OTHER: "v_unexplained",
-    diffanalysis.ALL_BLANK: "v_blank",
-    diffanalysis.ERROR: "v_error",
-}
-# Evidence is a sample, not a dump: enough to check a verdict by eye. Ten assets
-# is what the screen shows for the column a reviewer opened, so the workbook
-# carries the same depth for every differing column rather than a thinner one --
-# the export is the artefact that leaves the tool, and being asked "can you send
-# me a few more rows for this column" is the failure it exists to prevent.
-DIFF_EXPORT_EXAMPLE_COLUMNS = 25
-DIFF_EXPORT_EXAMPLE_ASSETS = diffanalysis.DEFAULT_EXAMPLE_ASSETS
-
 # Row groups per exported workbook. A pivot bigger than this is split across
 # several files, so this is a file-size choice, not a ceiling on the export --
 # and it is kept in step with what the pivot can hold at once, so that each file
@@ -211,47 +180,6 @@ class ExportManager:
         args = (job, dataset, filters, list(columns or []), order_by, descending,
                 row_limit, include_manifest, sheet_name, dict(transforms or {}))
         threading.Thread(target=self._run, args=args, daemon=True).start()
-        self.cleanup()
-        return job
-
-    def start_diff(
-        self,
-        dataset_id: str,
-        summary: Dict[str, Any],
-        config: Any,
-        fmt: str = "xlsx",
-        include_manifest: bool = True,
-        sheet_name: str = "Difference analysis",
-    ) -> ExportJob:
-        """Queue an export of a finished difference analysis.
-
-        The analysis itself is already done -- this only lays it out -- but it
-        still goes through the job machinery, because the examples sheet goes
-        back to the file for evidence and that is not something to do inside a
-        request.
-        """
-        dataset = self.engine.get(dataset_id)
-        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        base = os.path.splitext(dataset.display_name)[0][:60] or "export"
-        filename = "{}-diff-{}.{}".format(base, stamp, fmt)
-
-        job = ExportJob(
-            id=uuid.uuid4().hex[:12],
-            dataset_id=dataset_id,
-            fmt=fmt,
-            filename=filename,
-            kind="diff",
-            path=os.path.join(self.output_dir, "{}-{}".format(uuid.uuid4().hex[:8], filename)),
-        )
-        with self._lock:
-            self.jobs[job.id] = job
-
-        threading.Thread(
-            target=self._run_diff,
-            args=(job, dataset, summary, config, fmt, include_manifest,
-                  sheet_name or "Difference analysis"),
-            daemon=True,
-        ).start()
         self.cleanup()
         return job
 
@@ -473,263 +401,6 @@ class ExportManager:
             sheet.write(line, 1, describe(spec)[:EXCEL_MAX_CELL_CHARS])
             line += 1
 
-
-    # ------------------------------------------------------------- diff worker
-
-    def _run_diff(self, job, dataset, summary, config, fmt, include_manifest, sheet_name):
-        try:
-            job.status = "running"
-            job.total = len(summary.get("columns") or [])
-            job.message = "Writing the analysis…"
-            if fmt == "csv":
-                self._write_diff_csv(job, summary)
-                job.sheets = 1
-            else:
-                self._write_diff_xlsx(job, dataset, summary, config, sheet_name,
-                                      include_manifest)
-            if job._cancel.is_set():
-                raise _Cancelled()
-            job.size = os.path.getsize(job.path) if os.path.exists(job.path) else 0
-            job.status = "done"
-            job.message = "Ready to download"
-        except _Cancelled:
-            job.status = "cancelled"
-            job.message = "Export cancelled"
-            self._discard(job)
-        except Exception as exc:  # noqa: BLE001 - surfaced to the UI
-            job.status = "error"
-            job.error = "{}: {}".format(type(exc).__name__, exc)
-            job.message = "Export failed"
-            traceback.print_exc()
-            self._discard(job)
-        finally:
-            job.finished_at = time.time()
-
-    @staticmethod
-    def _write_diff_csv(job, summary):
-        """The summary sheet, and only that -- CSV has no room for the rest."""
-        with open(job.path, "w", newline="", encoding="utf-8-sig") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(DIFF_SUMMARY_HEADERS)
-            for record in summary.get("columns") or []:
-                writer.writerow([record.get(key) for key in DIFF_SUMMARY_FIELDS])
-                job.written += 1
-
-    def _write_diff_xlsx(self, job, dataset, summary, config, sheet_name, include_manifest):
-        """Summary, examples and exclusions -- the three questions a reviewer asks.
-
-        The verdict colours go on as conditional formats rather than as cell
-        formats so that the meaning survives the reader sorting or filtering the
-        sheet, which is the first thing anyone does with 70 rows.
-        """
-        book = xlsxwriter.Workbook(job.path, {"default_date_format": "yyyy-mm-dd",
-                                              "remove_timezone": True})
-        try:
-            f = _diff_formats(book)
-            records = summary.get("columns") or []
-
-            sheet = book.add_worksheet(sheet_name[:31])
-            sheet.activate()
-            sheet.set_column(0, 0, 34)
-            sheet.set_column(1, 1, 24)
-            sheet.set_column(2, len(DIFF_SUMMARY_HEADERS) - 2, 14)
-            sheet.set_column(len(DIFF_SUMMARY_HEADERS) - 1, len(DIFF_SUMMARY_HEADERS) - 1, 70)
-            for index, title in enumerate(DIFF_SUMMARY_HEADERS):
-                sheet.write(0, index, title, f["head"])
-            for line, record in enumerate(records, start=1):
-                for index, key in enumerate(DIFF_SUMMARY_FIELDS):
-                    value = record.get(key)
-                    fmt = f["pct"] if key.endswith("_pct") else f["cell"]
-                    if value is None:
-                        sheet.write_blank(line, index, None, fmt)
-                    elif isinstance(value, (int, float)) and not isinstance(value, bool):
-                        sheet.write_number(line, index, value, fmt)
-                    else:
-                        sheet.write(line, index, str(value)[:EXCEL_MAX_CELL_CHARS], fmt)
-                job.written += 1
-            if records:
-                sheet.autofilter(0, 0, len(records), len(DIFF_SUMMARY_HEADERS) - 1)
-                sheet.freeze_panes(1, 1)
-                verdict_at = DIFF_SUMMARY_FIELDS.index("verdict")
-                for verdict, key in DIFF_VERDICT_FORMATS.items():
-                    sheet.conditional_format(1, verdict_at, len(records), verdict_at, {
-                        "type": "cell", "criteria": "==",
-                        "value": '"{}"'.format(verdict), "format": f[key]})
-
-            self._write_diff_examples(job, dataset, summary, config, book, f)
-            self._write_diff_excluded(summary, book, f)
-            if include_manifest:
-                self._write_diff_manifest(dataset, summary, config, book, f)
-        finally:
-            book.close()
-
-    def _write_diff_examples(self, job, dataset, summary, config, book, f):
-        """Ten real assets per differing column, so the verdict is checkable."""
-        sheet = book.add_worksheet("Examples")
-        sheet.set_column(0, 0, 34)
-        sheet.set_column(1, 1, 18)
-        sheet.set_column(2, 2, 16)
-        sheet.set_column(3, 3, 44)
-        sheet.set_column(4, 4, 9)
-        sheet.set_column(5, 5, 13)
-        sheet.set_column(6, 6, 13)
-        key_label = (config.as_dict() if hasattr(config, "as_dict")
-                     else dict(config or {})).get("key_column") or "Key"
-        area_label = (config.as_dict() if hasattr(config, "as_dict")
-                      else dict(config or {})).get("explain_column") or "Row"
-        for index, title in enumerate(
-                ("Column", key_label, area_label, "Value", "Blank?",
-                 "Distinct values", "Distinct tuples")):
-            sheet.write(0, index, title, f["head"])
-        sheet.write_comment(0, 5, "How many distinct values THIS column has for the asset.")
-        sheet.write_comment(0, 6, "How many distinct versions of the WHOLE record exist for "
-                                  "the asset, once every checked column is considered together "
-                                  "-- the same figure as the on-screen and manifest headline, "
-                                  "just broken out per asset.")
-
-        differing = [r["column"] for r in (summary.get("columns") or [])
-                     if r["verdict"] in (diffanalysis.TRUE_DIFF_OTHER,
-                                         diffanalysis.TRUE_DIFF_BY_DEPR_AREA)]
-        analysed_columns = [r["column"] for r in (summary.get("columns") or [])]
-
-        # Two passes: gather every column's evidence first, so the whole-record
-        # tuple count can be looked up once for the keys actually shown here
-        # rather than re-scanned once per column that happens to mention them.
-        blocks = []
-        seen_keys = set()
-        for column in differing[:DIFF_EXPORT_EXAMPLE_COLUMNS]:
-            if job._cancel.is_set():
-                raise _Cancelled()
-            try:
-                found = diffanalysis.examples(self.engine, dataset, config, column,
-                                              limit=DIFF_EXPORT_EXAMPLE_ASSETS)
-            except Exception:  # noqa: BLE001 - one column's evidence, not the file
-                continue
-            blocks.append((column, found))
-            seen_keys.update(str(a["asset"]) for a in found.get("assets") or [])
-
-        tuple_counts = diffanalysis.record_tuple_counts(
-            self.engine, dataset, config, analysed_columns, seen_keys)
-
-        line = 1
-        for column, found in blocks:
-            for asset in found.get("assets") or []:
-                distinct = len(asset.get("distinct_values") or [])
-                tuples = tuple_counts.get(str(asset["asset"]))
-                for row in asset["rows"]:
-                    sheet.write(line, 0, column, f["cell"])
-                    sheet.write(line, 1, str(asset["asset"]), f["cell"])
-                    sheet.write(line, 2, "" if row["area"] is None else str(row["area"]),
-                                f["cell"])
-                    text = "" if row["value"] is None else str(row["value"])
-                    sheet.write(line, 3, text[:EXCEL_MAX_CELL_CHARS],
-                                f["diff_cell"] if asset["differs"] else f["cell"])
-                    sheet.write(line, 4, "yes" if row["blank"] else "", f["cell"])
-                    sheet.write_number(line, 5, distinct, f["cell"])
-                    if tuples is None:
-                        sheet.write_blank(line, 6, None, f["cell"])
-                    else:
-                        sheet.write_number(line, 6, tuples, f["cell"])
-                    line += 1
-        if line == 1:
-            sheet.write(1, 0, "No column showed a true difference.", f["cell"])
-        else:
-            sheet.autofilter(0, 0, line - 1, 6)
-            sheet.freeze_panes(1, 0)
-
-    @staticmethod
-    def _write_diff_excluded(summary, book, f):
-        """Which columns never got a verdict, and why -- an answer to "where is X?"."""
-        sheet = book.add_worksheet("Excluded columns")
-        sheet.set_column(0, 0, 34)
-        sheet.set_column(1, 1, 46)
-        sheet.write(0, 0, "Column", f["head"])
-        sheet.write(0, 1, "Why it was excluded", f["head"])
-        excluded = summary.get("excluded") or []
-        for line, record in enumerate(excluded, start=1):
-            sheet.write(line, 0, record.get("column", ""), f["cell"])
-            sheet.write(line, 1, record.get("reason", ""), f["cell"])
-        if not excluded:
-            sheet.write(1, 0, "Every column was analysed.", f["cell"])
-
-    @staticmethod
-    def _write_diff_manifest(dataset, summary, config, book, f):
-        sheet = book.add_worksheet("Export info")
-        sheet.set_column(0, 0, 26)
-        sheet.set_column(1, 1, 90)
-        sheet.write(0, 0, "Difference analysis", f["title"])
-
-        spec = config.as_dict() if hasattr(config, "as_dict") else dict(config or {})
-        grain = summary.get("duplicate_grain") or {}
-        if not grain.get("checked"):
-            grain_text = "Not checked — no depreciation-area column was chosen."
-        elif grain.get("unique"):
-            grain_text = "One row per ({}, {}) — the grain is what it should be.".format(
-                spec.get("key_column"), grain.get("column"))
-        else:
-            grain_text = (
-                "{:,} ({}, {}) pairs appear on more than one row ({:,} extra rows, worst "
-                "case {} rows for one pair). The extract is not one row per pair, so an "
-                "unexplained difference may be nothing more than that.".format(
-                    grain.get("duplicate_pairs", 0), spec.get("key_column"),
-                    grain.get("column"), grain.get("extra_rows", 0),
-                    grain.get("max_rows_per_pair", 0)))
-
-        record = summary.get("record_consistency") or {}
-        if not record.get("checked"):
-            record_text = "Not computed — no column was selected for the run."
-        else:
-            record_text = (
-                "{clean:,} of {total:,} keys ({pct}%) collapse to a single record once "
-                "every one of the {n} checked columns is considered together; "
-                "{bad:,} still hold a genuine conflict somewhere in the row."
-            ).format(clean=record.get("keys_clean", 0), total=record.get("keys_total", 0),
-                     pct=record.get("clean_pct", 0), n=record.get("columns_considered", 0),
-                     bad=record.get("keys_conflicting", 0))
-
-        sample = spec.get("sample_assets")
-        rows = [
-            ("Source file", dataset.path_label),
-            ("Exported at", _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-            ("Rows in file", "{:,}".format(dataset.row_count)),
-            ("Record consistency", record_text),
-            ("Grouping key", spec.get("key_column")),
-            ("Explanatory column", spec.get("explain_column") or "none"),
-            ("Sample mode", "{:,} assets sampled — figures are an estimate".format(sample)
-                            if sample else "Off — every asset was analysed"),
-            ("Assets analysed", "{:,}".format(summary.get("assets_analysed") or 0)),
-            ("Rows analysed", "{:,}".format(summary.get("rows_analysed") or 0)),
-            ("Columns analysed", str(summary.get("columns_analysed") or 0)),
-            ("Columns excluded", str(summary.get("columns_excluded") or 0)),
-            ("Columns selected", ", ".join(spec.get("include"))
-                                 if spec.get("include") is not None
-                                 else "every column in the file"),
-            ("Exclusions", ", ".join(spec.get("exclude") or []) or "none"),
-            ("Blank columns excluded", "yes" if spec.get("exclude_all_blank") else "no"),
-            ("Examples per differing column",
-             "{} assets, with every one of their rows".format(DIFF_EXPORT_EXAMPLE_ASSETS)),
-            ("Duplicate grain check", grain_text),
-        ]
-        for verdict, count in (summary.get("verdict_counts") or {}).items():
-            if count:
-                rows.append(("Verdict: {}".format(verdict), str(count)))
-
-        line = 2
-        for label, value in rows:
-            sheet.write(line, 0, label, f["manifest_label"])
-            sheet.write(line, 1, str(value)[:EXCEL_MAX_CELL_CHARS])
-            line += 1
-
-        line += 1
-        sheet.write(line, 0, "Filters applied", f["title"])
-        line += 1
-        active = [x for x in (spec.get("filters") or []) if x.get("enabled") is not False]
-        if not active:
-            sheet.write(line, 1, "None — the whole file was analysed")
-        for index, one in enumerate(active, start=1):
-            sheet.write(line, 0, "Filter {}".format(index), f["manifest_label"])
-            sheet.write(line, 1, describe(one)[:EXCEL_MAX_CELL_CHARS])
-            line += 1
 
     # ------------------------------------------------------------ pivot worker
 
@@ -1045,37 +716,6 @@ def _manifest_number(value: Any) -> str:
     if isinstance(value, int) and not isinstance(value, bool):
         return "{:,}".format(value)
     return str(value)
-
-
-def _diff_formats(book) -> Dict[str, Any]:
-    """Formats for the analysis workbook.
-
-    The verdict colours are the ones the screen uses, so a reviewer who saw the
-    table in the browser recognises the sheet: green agrees, blue complements,
-    EY yellow is explained by the depreciation area, red is not. The header band
-    is EY's #1A1A24 for the same reason -- a workbook that lands in someone's
-    inbox should look like it came from the same place as the screen did.
-    """
-    head = {"bold": True, "bg_color": "#1A1A24", "font_color": "#FFFFFF", "border": 1,
-            "border_color": "#2E2E38", "align": "left", "valign": "vcenter"}
-    def band(bg, fg):
-        return book.add_format({"bg_color": bg, "font_color": fg, "bold": True})
-    return {
-        "head": book.add_format(head),
-        "title": book.add_format({"bold": True, "font_size": 13, "font_color": "#1A1A24"}),
-        "manifest_label": book.add_format({"bold": True, "font_color": "#2E2E38"}),
-        "cell": book.add_format({"border": 1, "border_color": "#EAEAF2"}),
-        "pct": book.add_format({"num_format": "0.00", "border": 1, "border_color": "#EAEAF2"}),
-        "diff_cell": book.add_format({"border": 1, "border_color": "#EAEAF2",
-                                      "bg_color": "#FFF8B8"}),
-        "v_constant": band("#DFF7E4", "#0F6B1F"),
-        "v_sparse": band("#DCF0FD", "#035A8F"),
-        # The one verdict that fills with the brand yellow, dark ink on it.
-        "v_explained": band("#FFEB0A", "#1A1A24"),
-        "v_unexplained": band("#F7DDDD", "#A11C1C"),
-        "v_blank": band("#EAEAF2", "#747480"),
-        "v_error": band("#F7DDDD", "#7A1414"),
-    }
 
 
 def _pivot_formats(book) -> Dict[str, Any]:

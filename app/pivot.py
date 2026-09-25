@@ -388,7 +388,7 @@ def _run_query(engine, dataset, rows, columns, measures, filters, subtotals, max
     cur = engine.cursor()
     cur.execute(sql, args)
 
-    n_rows, n_cols, n_vals = len(rows), len(columns), len(measures)
+    n_rows, n_cols = len(rows), len(columns)
     cells: Dict[Tuple[Tuple, Optional[Tuple]], List[Any]] = {}
     col_keys = set()
     row_keys = set()

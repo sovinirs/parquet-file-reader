@@ -91,19 +91,10 @@
         <span class="pill" id="column-count"></span>
       </div>
       <input type="search" id="column-search" class="input small" placeholder="Find a column…" />
-      <!-- Two toolbars, one per job the rail does: hiding columns from the grid,
-           and picking the ones the difference analysis should check. -->
       <div class="rail-tools" id="rail-tools-data">
         <button class="link-btn" id="btn-show-all">Show all</button>
         <span class="dot-sep">·</span>
         <button class="link-btn" id="btn-hide-all">Hide all</button>
-      </div>
-      <div class="rail-tools" id="rail-tools-diff" hidden>
-        <button class="link-btn" id="btn-rail-suggested" title="Every column except the run metadata and the period amounts that are meant to differ">Suggested</button>
-        <span class="dot-sep">·</span>
-        <button class="link-btn" id="btn-rail-all">All</button>
-        <span class="dot-sep">·</span>
-        <button class="link-btn" id="btn-rail-none">Clear</button>
       </div>
     </div>
     <ul class="column-list" id="column-list"></ul>
@@ -114,7 +105,6 @@
     <nav class="view-switch">
       <button class="view-tab active" id="tab-data">Data</button>
       <button class="view-tab" id="tab-pivot">Pivot</button>
-      <button class="view-tab" id="tab-diff">Difference</button>
       <span class="view-hint" id="view-hint">Filters below apply to both views.</span>
     </nav>
 
@@ -220,172 +210,6 @@
         <span id="pivot-status-right"></span>
       </footer>
     </div><!-- /pivot-view -->
-
-    <!-- ─────────────────── difference analysis view ─────────────────── -->
-    <div class="view" id="diff-view" hidden>
-
-      <!-- Setup. Collapses to a one-line recap once a run has finished, because
-           by then the answer is what deserves the screen, not the question. -->
-      <section class="diff-setup" id="diff-setup">
-        <button class="setup-bar" id="diff-setup-toggle" aria-expanded="true">
-          <span class="setup-caret" id="diff-setup-caret">▾</span>
-          <span class="setup-step">Set up</span>
-          <span class="setup-recap" id="diff-setup-recap">Choose a key, then tick the columns to check.</span>
-          <span class="setup-edit" id="diff-setup-edit">Change</span>
-        </button>
-
-        <div class="setup-body" id="diff-setup-body">
-          <ol class="setup-steps">
-            <li class="setup-item">
-              <div class="step-mark">1</div>
-              <div class="step-main">
-                <div class="step-title">What counts as one thing?</div>
-                <div class="step-fields">
-                  <label class="field inline wide">
-                    <span>One row per <em>— the key</em></span>
-                    <select id="diff-key" class="input small"></select>
-                  </label>
-                  <label class="field inline wide">
-                    <span>Differences explained by <em>— optional</em></span>
-                    <select id="diff-explain" class="input small"></select>
-                  </label>
-                </div>
-              </div>
-            </li>
-
-            <li class="setup-item">
-              <div class="step-mark">2</div>
-              <div class="step-main">
-                <div class="step-title">
-                  Which columns should be checked?
-                  <span class="step-count" id="diff-pick-count">none yet</span>
-                </div>
-                <div class="step-hint">
-                  Nothing is checked until you pick it. Tick columns in the
-                  <b>Columns</b> list on the left — or use a shortcut:
-                  <span class="pick-actions">
-                    <button class="link-btn" id="diff-pick-suggested" title="Every column except the run metadata and the period amounts that are meant to differ">Suggested</button>
-                    <span class="dot-sep">·</span>
-                    <button class="link-btn" id="diff-pick-all">All</button>
-                    <span class="dot-sep">·</span>
-                    <button class="link-btn" id="diff-pick-none">Clear</button>
-                  </span>
-                </div>
-                <div class="picked-tray" id="diff-picked"></div>
-              </div>
-            </li>
-
-            <li class="setup-item">
-              <div class="step-mark">3</div>
-              <div class="step-main">
-                <div class="step-title">How much of the file?</div>
-                <div class="step-fields">
-                  <label class="field inline wide">
-                    <span>Coverage</span>
-                    <select id="diff-sample" class="input small">
-                      <option value="">Every asset — the real answer</option>
-                      <option value="10000" selected>10,000 assets — fast preview</option>
-                      <option value="1000">1,000 assets — very fast</option>
-                    </select>
-                  </label>
-                  <div class="step-checks">
-                    <label class="check tight">
-                      <input type="checkbox" id="diff-skip-blank" checked />
-                      <span>Set aside columns that are blank in every row</span>
-                    </label>
-                    <label class="check tight">
-                      <input type="checkbox" id="diff-use-filters" />
-                      <span>Only analyse the rows my filters match</span>
-                    </label>
-                  </div>
-                </div>
-              </div>
-            </li>
-          </ol>
-
-          <div class="setup-foot">
-            <div class="setup-note" id="diff-warning">
-              Each selected column is read across the file on its own, so a wide
-              selection takes minutes. Nothing runs until you press Run.
-            </div>
-            <div class="diff-actions">
-              <button class="btn" id="btn-diff-cancel" hidden>Cancel</button>
-              <button class="btn primary" id="btn-diff-run" disabled>Run analysis</button>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <div class="diff-progress" id="diff-progress" hidden>
-        <div class="progress-head">
-          <span id="diff-progress-label"></span>
-          <span class="mono" id="diff-progress-detail"></span>
-        </div>
-        <div class="progress-track"><div class="progress-fill" id="diff-progress-fill"></div></div>
-      </div>
-
-      <!-- The funnel: how far does the key still narrow as columns are added,
-           one at a time, in the order they were checked? Leads the answer,
-           because it's the most direct way to see which column costs what. -->
-      <div class="diff-waterfall" id="diff-waterfall" hidden></div>
-
-      <!-- The answer, headline first. -->
-      <div class="diff-verdictbar" id="diff-verdictbar" hidden>
-        <div class="vb-headline" id="diff-headline"></div>
-        <div class="vb-track" id="diff-vb-track"></div>
-        <div class="vb-legend chips" id="diff-filter-chips"></div>
-        <div class="vb-tools">
-          <input type="search" id="diff-search" class="input small" placeholder="Find a column…" />
-          <button class="btn" id="btn-diff-export" disabled>Export…</button>
-        </div>
-      </div>
-
-      <div class="diff-findings" id="diff-findings" hidden></div>
-
-      <div class="diff-split">
-        <div class="table-wrap" id="diff-wrap">
-          <table class="grid diff-grid" id="diff-grid">
-            <thead id="diff-head"></thead>
-            <tbody id="diff-body"></tbody>
-          </table>
-          <div class="pivot-empty" id="diff-empty">
-            <div class="empty-title">Which columns actually differ?</div>
-            <div class="empty-sub">
-              Say which column identifies one thing — an asset ID — then tick the
-              columns you want checked in the <b>Columns</b> list on the left.
-              Every ticked column is examined for whether the rows sharing a key
-              agree with each other, disagree, or merely fill in each other's blanks.
-            </div>
-          </div>
-        </div>
-
-        <aside class="diff-detail" id="diff-detail" hidden>
-          <header class="diff-detail-head">
-            <div class="dd-heading">
-              <div class="diff-detail-title" id="diff-detail-title"></div>
-              <div class="diff-detail-sub" id="diff-detail-sub"></div>
-            </div>
-            <button class="btn icon ghost" id="diff-detail-close" title="Close">×</button>
-          </header>
-          <div class="diff-detail-stats" id="diff-detail-stats"></div>
-          <div class="diff-detail-tools">
-            <input type="search" id="diff-asset-jump" class="input small"
-                   placeholder="Jump to a key value…" />
-            <div class="pager">
-              <button class="btn icon" id="diff-ex-prev" title="Previous examples">‹</button>
-              <span class="page-label" id="diff-ex-page">1</span>
-              <button class="btn icon" id="diff-ex-next" title="More examples">›</button>
-            </div>
-          </div>
-          <div class="diff-detail-body" id="diff-detail-body"></div>
-        </aside>
-      </div>
-
-      <footer class="statusbar">
-        <span id="diff-status-left"></span>
-        <span id="diff-status-right"></span>
-      </footer>
-    </div><!-- /diff-view -->
   </section>
 </main>
 

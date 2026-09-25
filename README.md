@@ -1,9 +1,8 @@
 # Parquet Studio
 
 A local parquet reader built for files with millions of rows: browse the schema,
-filter across as many columns as you like, build Excel-style pivot tables, run a
-column-by-column difference analysis before de-duplicating, and export any of it
-to Excel, CSV, Parquet or JSON.
+filter across as many columns as you like, build Excel-style pivot tables, and
+export any of it to Excel, CSV, Parquet or JSON.
 
 All processing is Python — [DuckDB](https://duckdb.org) reads the parquet file
 **in place** and pushes filters and column projections down into it. Nothing is
@@ -17,7 +16,6 @@ milliseconds and memory stays flat during export.
 - [Opening a file](#opening-a-file)
 - [Filtering](#filtering)
 - [Pivoting](#pivoting)
-- [Difference analysis](#difference-analysis)
 - [Exporting](#exporting)
 - [Theme](#theme)
 - [API reference](#api-reference)
@@ -55,7 +53,6 @@ No sample data yet? Generate one to try it against:
 
 ```bash
 .venv/bin/python tests/make_sample.py   # 3M-row orders.parquet — filtering, pivoting, exporting
-.venv/bin/python tests/make_assets.py   # small fixed-asset file — built for the Difference tab
 ```
 
 ## Opening a file
@@ -71,8 +68,8 @@ dataset, so partitioned exports work.
 **Union several files with the same columns…** under the path box stacks two or
 more files into one table. Give each file its own row (type a path or use its
 **Browse…**, and **+ Add another file** for more), then **Union and open**. The
-result behaves exactly like a single file: filtering, pivoting, difference
-analysis and every export format all work across it.
+result behaves exactly like a single file: filtering, pivoting and every export
+format all work across it.
 
 - Every file needs the same column names with the same types. Columns are matched
   by name, so their order may differ. If the files don't match, the panel says
@@ -103,9 +100,9 @@ keeps its name; its type reads e.g. `year of TIMESTAMP`.
   the years (in calendar order), Range takes e.g. months 3 to 5, and a pasted list
   like `2023, 2024` works too. A filter set on the full date is cleared when you
   switch, since it no longer applies.
-- Extraction is a Data view setting. The Pivot and Difference tabs group and
-  compare the raw values, but a filter set on an extracted part still means the
-  same thing there ("year is 2024").
+- Extraction is a Data view setting. The Pivot tab groups the raw values, but a
+  filter set on an extracted part still means the same thing there ("year is
+  2024").
 - The Excel export's *Export info* sheet lists which columns were extracted.
 
 **Dates stored as text.** When a file opens, the first 2,000 rows of every text
@@ -137,8 +134,7 @@ Other controls: click a header to sort (asc → desc → off), change the sample
 with **Rows** (10 to 250), page through with `‹ ›`, and use the eye icon in the
 rail to hide a column — hidden columns leave both the preview *and* the export.
 
-Filters set here apply everywhere: the Pivot and Difference tabs both read the
-same chips.
+Filters set here apply everywhere: the Pivot tab reads the same chips.
 
 ## Pivoting
 
@@ -196,122 +192,6 @@ it says. Sorting by a measure is the one thing truncation costs you — there ar
 too many groups to rank them all, so it ranks the ones shown, and the readout
 says so.
 
-## Difference analysis
-
-The **Difference** tab answers the question that comes before de-duplication:
-*if I collapse these rows to one per key, what would I lose?*
-
-The case it was built for is a SAP fixed-asset extract — one row per (asset,
-depreciation area), where the business wants one row per asset. Asset ID alone
-defines uniqueness, so every other column has to be checked: do the rows sharing
-an asset agree, and if not, why not?
-
-Setup is three numbered steps. Say which column identifies one thing (**One row
-per**) and which column ought to explain any variation (**Differences explained
-by**); tick the columns you want checked; choose how much of the file to cover.
-Then press **Run analysis** — nothing runs on its own, because this reads the
-file once per selected column and takes minutes on a large extract.
-
-**The Columns rail on the left is the picker.** In the Difference tab every rail
-row grows a tick box, and nothing starts ticked: you name the handful of columns
-you care about rather than un-naming the sixty you don't. The key column is
-marked `KEY` and cannot be ticked — it groups the rows, so it is not one of the
-columns compared across them. **Suggested** ticks everything except the run
-metadata and the period amounts that are *meant* to vary per area; **All** and
-**Clear** do what they say. What is ticked also shows as a removable chip in step
-2, so "what did I pick?" never means scrolling seventy rail rows.
-
-Once a run finishes the setup folds into a one-line recap (`one row per asset_id
-· explained by depr_area · 12 columns checked · every asset`) and the results
-take the screen. **Change** reopens it.
-
-For each column, per asset, it counts the **distinct non-blank values**. That one
-number separates the cases that matter:
-
-| Verdict | What it means | What to do when collapsing |
-| --- | --- | --- |
-| **Constant** | Every row of an asset agrees, with no blanks | Take any row |
-| **Sparse** | One value, the other rows blank — they complement rather than contradict | `MAX`/`ANY_VALUE` |
-| **Differs by area** | Values differ, but never *inside* one depreciation area | Needs a rule for which area wins |
-| **Unexplained** | Values still differ within the same area | Needs a business rule — look at the examples |
-| **All blank** | Nothing in any row | Drop it |
-| **Error** | The column could not be analysed | Decide by hand |
-
-**The headline is about the record, not any one column.** Above the table, a run
-reports how many keys collapse to a single row once *every* checked column is
-considered together — e.g. *420 of 500 keys (84%) hold a real conflict once all
-6 checked columns are considered together*. That's a stricter question than any
-single column's verdict: a key can have every individual column come back
-Constant or Sparse and still fail to collapse, because different rows disagree
-on *different* columns from each other. The number comes from packing every
-checked column's value into one tuple per row and counting how many **distinct
-tuples** each key produces — one tuple means the whole record already agrees, so
-the key collapses with nothing lost; more than one means a real conflict lives
-somewhere in the row, and the per-column breakdown underneath is what tells you
-where. It's a domain-neutral question — "how many distinct versions of this
-record exist" means the same thing whether the key is an asset, an order or a
-customer — so it reads the same whether or not the dataset is a SAP extract.
-
-Underneath that headline, a proportional track of the per-column verdicts and
-the chips that filter by them break down *which* columns are behind the
-conflicts. Clicking a segment isolates a pile. **Unexplained** is the one the
-tab exists for, and the table sorts it to the top by default, widest problem
-first.
-
-Each row then carries the column, its verdict, a **split bar** — one proportional
-bar showing how the keys divide between agreeing, complementing, disagreeing and
-blank, with the exact counts on hover — the number of keys that disagree, and
-what to do about it when collapsing. The bar replaced four percentage columns and
-a distinct-value count: how much of a column disagrees is a proportion, and a
-proportion reads faster as a length than as five numbers. The counts themselves
-live in the drill-down, where they matter.
-
-Some things worth knowing about how it gets there:
-
-- **Blank means one thing.** Every value goes through
-  `NULLIF(TRIM(CAST(x AS VARCHAR)), '')`, so a NULL number, an empty string and a
-  cell of spaces are the same concept rather than three different values. Without
-  that, a column of whitespace padding reads as a difference.
-- **One column at a time.** Parquet is columnar, so each column's query touches
-  only that column and the key. Unpivoting 70 columns would turn 100M rows into
-  7 billion.
-- **Empty columns are found first**, in a single pass with no grouping, and skip
-  the expensive per-asset work entirely.
-- **The grain is checked up front and reported on its own.** If an (asset,
-  depreciation area) pair appears on more than one row, the extract is not at the
-  grain the analysis assumes, and an "unexplained" difference may be duplicate
-  rows rather than conflicting data. That finding sits above the table rather
-  than being folded into the column results, because it changes how they read.
-- **One bad column does not stop the run.** It is marked `ERROR` with the reason,
-  and the other 69 carry on.
-
-**Sample mode** runs over a random sample of *assets* (not rows — an asset's rows
-only mean something together) for a fast preview before committing to the full
-pass. Turn on **Only analyse the rows my filters match** to scope a run to
-whatever the filter chips currently select.
-
-Selecting a column opens the drill-down, which is the piece that makes this land
-with a business reviewer: the counts behind the verdict, then **ten real assets**
-per page, each with the distinct values named once and then every one of its rows,
-with the cells that disagree highlighted. Page through more examples, or type an
-asset ID to jump straight to a case someone has asked about.
-
-**Export** writes a workbook with a summary sheet (one row per column, every
-metric, colour-coded by verdict as conditional formatting), an **Examples** sheet
-carrying **ten real key values for every differing column** — with each one's full
-set of rows, the disagreeing cells highlighted, and a distinct-value count — and a
-sheet listing every column that never got a verdict and why. The **Export info**
-manifest records the key column, the columns you selected, whether sample mode was
-on, how deep the examples go, the duplicate-grain finding, and the same whole-record
-consistency figures as the on-screen headline — so the workbook explains how it was
-produced. CSV gives the summary table alone, with no examples.
-
-Each column's **"what to do when collapsing"** text names whichever column you
-actually picked as "Differences explained by" — "requires a business rule for
-which `depr_area` wins," not a fixed reference to depreciation area — so it reads
-correctly whatever the explanatory column is actually called, or if you leave
-it unset.
-
 ## Exporting
 
 **Export** opens a drawer showing exactly what you're about to write out. Choose:
@@ -355,7 +235,7 @@ The interface follows EY's design language, taken from EY's own stylesheet
 rather than from memory: `#1a1a24` dark and `#ffeb0a` yellow over the
 `#f6f6fa` / `#eaeaf2` / `#c2c2cf` / `#747480` grey ramp, squared corners
 (`border-radius: 0`), and the 4px yellow beam that marks whatever is active —
-the selected tab, a filtered column, a field in a pivot well, a warning finding.
+the selected tab, a filtered column, a field in a pivot well.
 Both palettes are in `styles.css`; the ☾/☀ button in the top bar switches them,
 and the masthead stays `#1a1a24` in both, as it does on ey.com.
 
@@ -373,11 +253,6 @@ Three deliberate departures:
   tool has no claim to. `EYInterstate` is asked for first in the font stack and
   used if the machine has it; it is licensed to EY and is not bundled here.
 
-The verdict colours in the Difference tab map onto EY's semantic palette —
-`#1eca3a` agrees, `#21acf6` complements, brand yellow means the depreciation
-area explains it, `#a11c1c` means it does not — and the exported workbook uses
-the same colours, so a sheet in someone's inbox matches the screen it came from.
-
 ## API reference
 
 The UI is a plain client of this JSON API — anything the browser does, a script
@@ -390,6 +265,7 @@ everything that queries a file.
 | `GET /api/recents` | Recently opened files (persisted to `~/.parquet-reader-recents.json`) |
 | `GET /api/browse?path=` | List a directory's subfolders and `.parquet` files |
 | `POST /api/open` | Open a file or folder by absolute path → dataset info (id, columns, row count) |
+| `POST /api/union` | Open several files with the same columns as one table (`paths`, optional `source_column`) |
 | `POST /api/upload` | Upload a `.parquet` file (drag-and-drop / Browse) → dataset info |
 | `GET /api/dataset/{id}` | Re-fetch a previously opened dataset's info |
 | `DELETE /api/dataset/{id}` | Close a dataset and free its handle |
@@ -400,13 +276,6 @@ everything that queries a file.
 | `GET /api/pivot/aggregations` | The aggregations the Values well offers, and the pivot's size limits |
 | `POST /api/pivot` | Build a pivot table (rows, columns, values, filters, sort, toggles) |
 | `POST /api/pivot/export` | Start a background pivot → Excel export job |
-| `GET /api/diff/defaults` | Suggested column set, verdict list, recommendations text, and the example page size |
-| `POST /api/diff/start` | Start a difference-analysis run → job id. `include` is the ticked column set; omit it to analyse every column |
-| `GET /api/diff/status/{job_id}` | Poll progress; includes every column finished so far |
-| `POST /api/diff/cancel/{job_id}` | Cancel a running analysis |
-| `GET /api/diff/results/{job_id}` | The finished run's full summary |
-| `GET /api/diff/examples/{job_id}/{column}` | Drill-down: real rows behind one column's verdict |
-| `POST /api/diff/export/{job_id}` | Export a finished analysis to Excel or CSV |
 | `POST /api/export` | Start a background row export job (xlsx/csv/parquet/json) |
 | `GET /api/export/{job_id}` | Poll export progress |
 | `POST /api/export/{job_id}/cancel` | Cancel a running export |
@@ -425,37 +294,37 @@ Filter objects passed to any endpoint share one shape:
 ./tests/run.sh
 ```
 
-Runs 126 API checks — every filter operator, every pivot cell, subtotal and grand
-total, and every difference-analysis verdict, each cross-checked against the same
-question asked of DuckDB in hand-written SQL — plus 68 UI checks that drive the
-real interface in headless Chrome, from opening a file through filtering,
-sorting, pivoting, exporting and downloading the result, and 35 more that drive
-the Difference tab end to end against a purpose-built fixture.
+Four suites, in this order:
 
-`tests/make_assets.py` generates that fixture: a small fixed-asset file where
-every column has exactly one defensible verdict, including a duplicated (asset,
-depreciation area) pair. Two of its columns differ in ways that look identical
-until you check within a depreciation area — which is precisely what the
-attribution pass has to get right.
+| Suite | What it covers |
+| --- | --- |
+| `tests/test_units.py` | Every function in `app/`, called directly with no server, against a small fixture that has one of every column type the app handles (nulls, empty strings, decimals, booleans, dates, timestamps, times, lists, structs, dates stored as text and as `YYYYMMDD` integers, literal `%`/`_`). Expectations come from hand-written DuckDB SQL over the same file. Run it on its own with `.venv/bin/python -m unittest tests.test_units -v`. |
+| `tests/test_api.py` | The HTTP API end to end on the 3M-row sample: every filter operator, pivot cells and totals, date extraction, text dates, unions and every export format, each cross-checked against SQL. |
+| `tests/ui_selftest.html` | The real interface in headless Chrome, from opening a file through filtering, sorting, pivoting, exporting and downloading the result. |
+| `tests/js_units.html` | `app.js`'s own helpers in headless Chrome: number and size formatting, pasted-list parsing, filter descriptions, date extraction and pivot state. |
+
+The UI suites need Google Chrome; set `CHROME=/path/to/chrome` if it is not in
+the default macOS location, or they are skipped.
 
 ## Layout
 
 ```
 app/
   main.py          FastAPI routes; query endpoints run in a threadpool
-  engine.py        DuckDB session, previews, counts, value lists, stats
-  filters.py       filter model → parameterised SQL
+  engine.py        DuckDB session, opening files and unions, previews, counts,
+                   value lists, stats, and spotting dates stored as text
+  filters.py       filter model → parameterised SQL, and date-part extraction
   pivot.py         cross-tabs: one GROUPING SETS query → cells, subtotals, totals
-  diffanalysis.py  per-column agreement across rows sharing a key, and why
-  exporter.py      background export jobs (streaming xlsx, native CSV/parquet,
-                   the pivot workbook writer, and the diff-analysis writer)
+  exporter.py      background export jobs (streaming xlsx, native CSV/parquet/JSON,
+                   and the pivot workbook writer)
   static/          the UI — no build step, no dependencies
 tests/
-  test_api.py        API + filter/pivot/diff-semantics tests
-  ui_selftest.html    headless-Chrome UI walkthrough
-  diff_selftest.html  headless-Chrome walkthrough of the Difference tab
-  make_sample.py      generates sample/orders.parquet
-  make_assets.py      generates sample/assets.parquet (the diff fixture)
+  run.sh             runs every suite below
+  test_units.py      unit tests for every function in app/
+  test_api.py        API tests against the sample file
+  ui_selftest.html   headless-Chrome UI walkthrough
+  js_units.html      headless-Chrome checks of app.js's helpers
+  make_sample.py     generates sample/orders.parquet
 ```
 
 ## Notes

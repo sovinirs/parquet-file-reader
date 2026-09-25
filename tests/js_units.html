@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="/static/styles.css"></head>
+<body>
+<div id="results" style="display:none">PENDING</div>
+<script>
+/* Unit checks for app.js's own helpers -- formatting, parsing, the filter
+   descriptions, date extraction and pivot state -- run against the real script
+   in headless Chrome. The UI walkthrough (ui_selftest.html) covers the flows;
+   this covers the functions those flows are built from. */
+const log = [];
+const eq = (name, got, want) => {
+  const g = JSON.stringify(got), w = JSON.stringify(want);
+  log.push(`${g === w ? 'PASS' : 'FAIL'} | ${name} | ${g === w ? '' : `got ${g}, want ${w}`}`);
+};
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+(async () => {
+  try {
+    const html = await (await fetch('/')).text();
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    document.body.insertAdjacentHTML('beforeend', doc.body.innerHTML);
+    await new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = '/static/app.js'; s.onload = res; s.onerror = rej;
+      document.body.appendChild(s);
+    });
+    const path = new URLSearchParams(location.search).get('path');
+    await openPath(path);
+
+    // --- formatting helpers ---
+    eq('fmtNum groups thousands', fmtNum(1234567), new Intl.NumberFormat().format(1234567));
+    eq('fmtNum blank', [fmtNum(null), fmtNum(undefined)], ['—', '—']);
+    eq('fmtBytes', [fmtBytes(0), fmtBytes(512), fmtBytes(1536), fmtBytes(150 * 1024 * 1024)],
+       ['0 B', '512 B', '1.5 KB', '150 MB']);
+    eq('fmtDuration', [fmtDuration(42.4), fmtDuration(125)], ['42s', '2m 5s']);
+    const node = el('span', 'a b', 'hi');
+    eq('el builds a node', [node.tagName, node.className, node.textContent], ['SPAN', 'a b', 'hi']);
+    eq('el without text', el('div').textContent, '');
+    let calls = 0;
+    const bump = debounce(() => { calls += 1; }, 30);
+    bump(); bump(); bump();
+    await sleep(80);
+    eq('debounce collapses a burst into one call', calls, 1);
+
+    // --- filter descriptions ---
+    eq('valueLabel', [valueLabel(null), valueLabel(''), valueLabel(0), valueLabel('x')],
+       [NULL_LABEL, '(empty)', '0', 'x']);
+    eq('describe: nullary', describeFilter({ op: 'is_null' }), { op: 'is blank', value: '' });
+    eq('describe: set, first three then a count',
+       describeFilter({ op: 'in', values: ['a', null, 'c', 'd', 'e'] }),
+       { op: 'is any of', value: `a, ${NULL_LABEL}, c +2` });
+    eq('describe: default op is in', describeFilter({ values: ['a'] }).op, 'is any of');
+    eq('describe: open range', describeFilter({ op: 'between', value: '', value2: 5 }),
+       { op: 'between', value: '−∞ … 5' });
+    eq('describe: range', describeFilter({ op: 'not_between', value: 1, value2: null }),
+       { op: 'not between', value: '1 … ∞' });
+    eq('describe: scalar', describeFilter({ op: 'gte', value: 3 }), { op: '≥', value: '3' });
+
+    // --- pasted value lists ---
+    eq('parse: commas', parseValueList('a, b ,c'), ['a', 'b', 'c']);
+    eq('parse: lines and tabs from a spreadsheet', parseValueList('a\nb\r\nc\td\n'), ['a', 'b', 'c', 'd']);
+    eq('parse: quotes keep commas', parseValueList('"Smith, J", x, "say ""hi"""'), ['Smith, J', 'x', 'say "hi"']);
+    eq('parse: stray quotes in plain text survive', parseValueList('5" screen, a"b'), ['5" screen', 'a"b']);
+    eq('parse: blanks and repeats dropped', parseValueList(' , a,, a ,b'), ['a', 'b']);
+    eq('parse: empty input', [parseValueList(''), parseValueList(null)], [[], []]);
+    eq('listToken quotes only when needed', [listToken('plain'), listToken('a,b'), listToken('say "x"')],
+       ['plain', '"a,b"', '"say ""x"""']);
+    const awkward = ['Smith, J', 'tab\there', 'q"uote', 'plain'];
+    eq('listToken round-trips through parseValueList',
+       parseValueList(awkward.map(listToken).join(', ')), awkward);
+
+    // --- filter panel shapes ---
+    eq('tabsFor', ['numeric', 'temporal', 'boolean', 'complex', 'other', 'text'].map(tabsFor), [
+      ['range', 'values', 'condition'], ['range', 'values', 'condition'], ['values', 'condition'],
+      ['condition'], ['condition'], ['values', 'condition']]);
+    const ops = (c) => opsFor(c).map(([v]) => v);
+    eq('opsFor text offers list ops', ['in', 'not_in'].every((o) => ops('text').includes(o)), true);
+    eq('opsFor numeric offers list ops', ops('numeric').includes('in'), true);
+    eq('opsFor boolean has no list ops', ops('boolean'), ['eq', 'is_null', 'is_not_null']);
+    eq('opsFor complex has no list ops', ops('complex').includes('in'), false);
+
+    // --- date helpers ---
+    eq('isBareDate', [isBareDate('2024-01-31'), isBareDate('2024-01-31 10:00'), isBareDate(20240131)],
+       [true, false, false]);
+    eq('dayStart / dayEnd', [dayStart('2024-01-31'), dayEnd('2024-01-31T09:00')],
+       ['2024-01-31 00:00:00', '2024-01-31 23:59:59.999999']);
+    eq('isTimestampColumn', [
+      isTimestampColumn({ category: 'temporal', type: 'TIMESTAMP' }),
+      isTimestampColumn({ category: 'temporal', type: 'DATE' }),
+      isTimestampColumn({ category: 'text', type: 'TIMESTAMP' })], [true, false, false]);
+    eq('toInputValue', [toInputValue(null, true), toInputValue('2024-01-31 10:00', true), toInputValue(5, false)],
+       ['', '2024-01-31', 5]);
+    eq('formatStat', [formatStat(null), formatStat('2024-01-31T00:00', true), formatStat(1.23456789), formatStat('x')],
+       ['—', '2024-01-31', new Intl.NumberFormat().format(1.2346), 'x']);
+
+    // --- extracting date parts, on a stand-in dataset ---
+    const realDataset = state.dataset;
+    state.dataset = { id: 'fake', columns: [
+      { name: 'd', type: 'DATE', category: 'temporal' },
+      { name: 'ts', type: 'TIMESTAMP WITH TIME ZONE', category: 'temporal' },
+      { name: 'clock', type: 'TIME', category: 'temporal' },
+      { name: 'txt', type: 'VARCHAR', category: 'text', date_formats: ['%d/%m/%Y', '%m/%d/%Y'] },
+      { name: 'n', type: 'INTEGER', category: 'numeric', date_formats: ['%Y%m%d'] },
+      { name: 'plain', type: 'VARCHAR', category: 'text' },
+    ] };
+    const col = (name) => state.dataset.columns.find((c) => c.name === name);
+    eq('canExtract', state.dataset.columns.map((c) => canExtract(c)), [true, true, false, true, true, false]);
+    eq('isTextDate', state.dataset.columns.map((c) => isTextDate(c)), [false, false, false, true, true, false]);
+    eq('formatLabel', ['iso', '%d/%m/%Y', '%b %d, %Y', '%d %B %Y', '%Y%m%d%H%M%S'].map(formatLabel),
+       ['YYYY-MM-DD', 'DD/MM/YYYY', 'Mon DD, YYYY', 'DD Month YYYY', 'YYYYMMDDhhmmss']);
+    state.transforms = {};
+    state.dateFormats = {};
+    eq('no extraction: column unchanged', effectiveColumn(col('d')), col('d'));
+    eq('typeLabel without extraction falls back', typeLabel('d', 'DATE'), 'DATE');
+    state.transforms = { d: 'year', txt: 'month' };
+    const shown = effectiveColumn({ name: 'd' });
+    eq('extracted date column is numeric', [shown.type, shown.category, shown.transform, shown.dateFormat],
+       ['BIGINT', 'numeric', 'year', null]);
+    eq('extracted text date carries its layout', effectiveColumn(col('txt')).dateFormat, '%d/%m/%Y');
+    eq('transformsPayload', transformsPayload(), { d: 'year', txt: { part: 'month', format: '%d/%m/%Y' } });
+    eq('typeLabel', [typeLabel('d', 'x'), typeLabel('txt', 'x')], ['year of DATE', 'month of VARCHAR (DD/MM/YYYY)']);
+    state.dateFormats = { txt: '%m/%d/%Y' };
+    eq('a chosen layout wins', [dateFormatOf(col('txt')), transformsPayload().txt.format], ['%m/%d/%Y', '%m/%d/%Y']);
+    state.dataset = realDataset;
+    state.transforms = {};
+    state.dateFormats = {};
+
+    // --- dataset-level helpers on the real file ---
+    eq('rawColumn', rawColumn('region').type, 'VARCHAR');
+    state.hidden = new Set(['notes']);
+    eq('visibleColumns leaves hidden ones out', visibleColumns().includes('notes'), false);
+    state.hidden = new Set();
+    state.filters = { a: { column: 'a' }, b: { column: 'b' } };
+    eq('activeFilters', activeFilters().map((f) => f.column), ['a', 'b']);
+    state.filters = {};
+
+    // --- pivot state ---
+    await loadAggregations();
+    eq('aggregations load', AGGS.map((a) => a.id).includes('count_rows'), true);
+    eq('aggLabel', [aggLabel('avg'), aggLabel('unknown')], ['Average', 'unknown']);
+    eq('aggAllowed', [aggAllowed({ categories: ['numeric'] }, 'text'), aggAllowed({ categories: null }, 'text')],
+       [false, true]);
+    eq('defaultAgg', [defaultAgg({ category: 'numeric' }), defaultAgg({ category: 'text' })], ['sum', 'count']);
+    eq('valueChipLabel', [valueChipLabel({ agg: 'count_rows' }), valueChipLabel({ agg: 'sum', column: 'amount' })],
+       ['Count of rows', 'Sum of amount']);
+    state.pivot = newPivotState();
+    eq('a new pivot is empty', pivotIsEmpty(), true);
+    addToWell('rows', 'region');
+    addToWell('values', 'amount');
+    addToWell('values', 'region');
+    eq('addToWell', [state.pivot.rows, state.pivot.values],
+       [['region'], [{ column: 'amount', agg: 'sum' }, { column: 'region', agg: 'count' }]]);
+    eq('no longer empty', pivotIsEmpty(), false);
+    addToWell('columns', 'region');
+    eq('a field groups in one direction only', [state.pivot.rows, state.pivot.columns], [[], ['region']]);
+    addToWell('rows', 'nope');
+    eq('unknown columns are ignored', state.pivot.rows, []);
+    addToWell('rows', 'status');
+    addToWell('rows', 'product');
+    moveField('rows', 1, 0);
+    eq('moveField reorders', state.pivot.rows, ['product', 'status']);
+    moveToWell('values', 0, 'rows', 1);
+    eq('moveToWell translates a value into a row field',
+       [state.pivot.rows, state.pivot.values.length], [['product', 'amount', 'status'], 1]);
+    state.pivot.sort = { by: 'value', value_index: 0, descending: true };
+    const payload = pivotPayload();
+    eq('pivotPayload', [payload.rows, payload.columns, payload.values, payload.row_totals, payload.sort],
+       [['product', 'amount', 'status'], ['region'], [{ column: 'region', agg: 'count' }], true,
+        { by: 'value', value_index: 0, descending: true }]);
+    eq('fmtPivotCell', [fmtPivotCell(null), fmtPivotCell(true), fmtPivotCell('2024-01-31T00:00'),
+                        fmtPivotCell(1234, true), fmtPivotCell(Infinity)],
+       ['', 'true', '2024-01-31 00:00', new Intl.NumberFormat().format(1234), 'Infinity']);
+    eq('integralLeaves', integralLeaves({
+      leaves: [{ is_count: true }, { is_count: false }, { is_count: false }],
+      rows: [{ cells: [1.5, 2, 2.5] }, { cells: [3, null, 1] }] }), [true, true, false]);
+
+    // --- the difference analysis is gone ---
+    eq('no Difference tab', document.getElementById('tab-diff'), null);
+    eq('no Difference view', document.getElementById('diff-view'), null);
+    eq('no diff state or code', [typeof state.diff, typeof newDiffState, typeof runDiff],
+       ['undefined', 'undefined', 'undefined']);
+    eq('two views', [...document.querySelectorAll('.view-tab')].map((b) => b.textContent), ['Data', 'Pivot']);
+  } catch (error) {
+    log.push(`FAIL | harness crashed | ${error && error.stack || error}`);
+  }
+  const out = document.getElementById('results');
+  out.textContent = log.join('\n');
+  out.style.display = 'block';
+})();
+</script>
+</body></html>

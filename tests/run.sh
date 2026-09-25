@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Full verification: API + filter semantics, then the UI driven in headless Chrome.
+# Full verification: unit tests, API + filter semantics, then the UI and the
+# front end's own helpers driven in headless Chrome.
 #   ./tests/run.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -9,16 +10,19 @@ BASE="http://127.0.0.1:${PORT}"
 PY=.venv/bin/python
 CHROME="${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
 SAMPLE="$(pwd)/sample/orders.parquet"
-ASSETS="$(pwd)/sample/assets.parquet"
 
 [ -x "$PY" ] || { echo "Run ./run.sh once first to create .venv"; exit 1; }
 [ -f "$SAMPLE" ] || $PY tests/make_sample.py
-[ -f "$ASSETS" ] || $PY tests/make_assets.py
 
+echo "═══ Unit tests (every function in app/, no server) ═══"
+$PY -m unittest tests.test_units 2>&1 | tail -4
+UNIT_STATUS=${PIPESTATUS[0]}
+
+echo
 echo "Starting test server on ${PORT}…"
 $PY -m uvicorn app.main:app --host 127.0.0.1 --port "$PORT" >/tmp/pqs-test.log 2>&1 &
 SERVER=$!
-trap 'kill $SERVER 2>/dev/null; rm -f app/static/__selftest.html app/static/__diffselftest.html' EXIT
+trap 'kill $SERVER 2>/dev/null; rm -f app/static/__selftest.html app/static/__jsunits.html' EXIT
 
 for _ in $(seq 1 40); do
   curl -sf "${BASE}/api/recents" >/dev/null 2>&1 && break
@@ -35,7 +39,7 @@ echo "═══ UI workflow (headless Chrome) ═══"
 if [ ! -x "$CHROME" ]; then
   echo "  skipped — Chrome not found at $CHROME (set CHROME=/path/to/chrome)"
   UI_STATUS=0
-  DIFF_STATUS=0
+  JS_STATUS=0
 else
   # The harness must be same-origin to fetch the app's own HTML.
   cp tests/ui_selftest.html app/static/__selftest.html
@@ -59,15 +63,14 @@ PY
   UI_STATUS=$?
 
   echo
-  echo "═══ Difference analysis UI (headless Chrome) ═══"
-  cp tests/diff_selftest.html app/static/__diffselftest.html
-  ENCODED=$($PY -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$ASSETS")
-  "$CHROME" --headless --disable-gpu --no-sandbox --virtual-time-budget=120000 \
-    --dump-dom "${BASE}/static/__diffselftest.html?path=${ENCODED}" 2>/dev/null > /tmp/pqs-diff.html
-  rm -f app/static/__diffselftest.html
-  $PY - <<'DIFFPY'
+  echo "═══ Front-end helpers (headless Chrome) ═══"
+  cp tests/js_units.html app/static/__jsunits.html
+  "$CHROME" --headless --disable-gpu --no-sandbox --virtual-time-budget=60000 \
+    --dump-dom "${BASE}/static/__jsunits.html?path=${ENCODED}" 2>/dev/null > /tmp/pqs-js.html
+  rm -f app/static/__jsunits.html
+  $PY - <<'JSPY'
 import html, re, sys
-dom = open('/tmp/pqs-diff.html').read()
+dom = open('/tmp/pqs-js.html').read()
 match = re.search(r'<div id="results"[^>]*>(.*?)</div>', dom, re.S)
 if not match:
     print("  FAIL — the harness produced no results"); sys.exit(1)
@@ -77,13 +80,13 @@ for line in lines:
 bad = sum(1 for l in lines if l.startswith('FAIL'))
 print("\n  {} passed, {} failed".format(len(lines) - bad, bad))
 sys.exit(1 if bad else 0)
-DIFFPY
-  DIFF_STATUS=$?
+JSPY
+  JS_STATUS=$?
 fi
 
 echo
-if [ $API_STATUS -eq 0 ] && [ $UI_STATUS -eq 0 ] && [ $DIFF_STATUS -eq 0 ]; then
+if [ $UNIT_STATUS -eq 0 ] && [ $API_STATUS -eq 0 ] && [ $UI_STATUS -eq 0 ] && [ $JS_STATUS -eq 0 ]; then
   echo "All checks passed."
 else
-  echo "Some checks failed (api=$API_STATUS ui=$UI_STATUS diff=$DIFF_STATUS)"; exit 1
+  echo "Some checks failed (unit=$UNIT_STATUS api=$API_STATUS ui=$UI_STATUS js=$JS_STATUS)"; exit 1
 fi

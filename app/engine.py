@@ -42,10 +42,11 @@ def categorise(sql_type: str) -> str:
         return "boolean"
     if t.startswith(("STRUCT", "MAP", "UNION")) or t.endswith("[]") or t.startswith("LIST"):
         return "complex"
-    if t.startswith(NUMERIC_PREFIXES):
-        return "numeric"
+    # Temporal first: "INTERVAL" would otherwise match the numeric "INT" prefix.
     if t.startswith(TEMPORAL_PREFIXES):
         return "temporal"
+    if t.startswith(NUMERIC_PREFIXES):
+        return "numeric"
     if t.startswith(TEXT_PREFIXES):
         return "text"
     return "other"
