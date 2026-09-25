@@ -183,6 +183,7 @@ body {
 }
 .input.small { padding: 5px 9px; font-size: 12px; }
 select.input { cursor: pointer; }
+textarea.list-input { resize: vertical; min-height: 84px; font-family: var(--mono, ui-monospace, monospace); font-size: 12px; line-height: 1.5; }
 
 .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
 .field > span { font-size: 12px; font-weight: 600; color: var(--text-dim); letter-spacing: .02em; }

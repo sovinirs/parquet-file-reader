@@ -301,7 +301,8 @@ class ExportManager:
                 self._write_xlsx(job, dataset, filters, columns, order_by, descending,
                                  row_limit, include_manifest, sheet_name)
             else:
-                self.engine.copy_to(dataset, job.path, job.fmt, filters, columns, order_by, descending)
+                self.engine.copy_to(dataset, job.path, job.fmt, filters, columns, order_by, descending,
+                                    row_limit)
                 job.written = job.total or 0
 
             if job._cancel.is_set():

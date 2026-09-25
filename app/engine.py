@@ -341,9 +341,12 @@ class Engine:
         columns: Optional[Sequence[str]] = None,
         order_by: Optional[str] = None,
         descending: bool = False,
+        row_limit: Optional[int] = None,
     ) -> None:
         """Native DuckDB export -- parallel and far faster than row-by-row."""
         sql, params, _ = self.query_sql(dataset, filters, columns, order_by, descending)
+        if row_limit:
+            sql += " LIMIT {}".format(int(row_limit))
         options = {
             "csv": "(FORMAT CSV, HEADER, DELIMITER ',')",
             "parquet": "(FORMAT PARQUET, COMPRESSION ZSTD)",

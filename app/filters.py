@@ -85,10 +85,16 @@ def build_predicate(spec: Dict[str, Any], sql_type: str) -> Tuple[str, List[Any]
         if not concrete and not wants_null:
             raise FilterError("Filter on {!r} has no selected values".format(column))
 
+        # Pasted value lists ask for case-insensitive matching explicitly; the
+        # value picker never does, because it offers the column's exact values.
+        fold = spec.get("case_sensitive") is False and _is_text_type(sql_type)
+        target = "lower({})".format(col) if fold else col
+
         clauses: List[str] = []
         if concrete:
-            placeholders = ", ".join(_operand(sql_type) for _ in concrete)
-            clauses.append("{} {}IN ({})".format(col, "NOT " if op == "not_in" else "", placeholders))
+            placeholder = "lower(?)" if fold else _operand(sql_type)
+            placeholders = ", ".join(placeholder for _ in concrete)
+            clauses.append("{} {}IN ({})".format(target, "NOT " if op == "not_in" else "", placeholders))
             params.extend(concrete)
 
         if op == "in":

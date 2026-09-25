@@ -257,6 +257,14 @@ def main():
          "(notes NOT IN ('Note for order 5') OR notes IS NULL)"),
         ("in including blanks", [{"column": "notes", "op": "in", "values": [None, "Note for order 5"]}],
          "(notes IN ('Note for order 5') OR notes IS NULL)"),
+        ("pasted list, case-insensitive",
+         [{"column": "region", "op": "in", "values": ["NORTH", "East"], "case_sensitive": False}],
+         "lower(region) IN ('north','east')"),
+        ("pasted list, match case", [{"column": "region", "op": "in", "values": ["NORTH", "east"],
+                                      "case_sensitive": True}],
+         "region IN ('NORTH','east')"),
+        ("pasted numeric list", [{"column": "quantity", "op": "in", "values": ["10", "20", "30"]}],
+         "quantity IN (10, 20, 30)"),
         ("numeric between", [{"column": "amount", "op": "between", "value": 100, "value2": 500}],
          "amount >= 100 AND amount <= 500"),
         ("open-ended range", [{"column": "quantity", "op": "between", "value": None, "value2": 50}],
@@ -430,6 +438,60 @@ def main():
     check("injection in a pivot field", call("/api/pivot", {
         "dataset_id": did, "rows": ['x"; DROP TABLE t; --'],
         "values": [{"agg": "count_rows"}]})["HTTP_ERROR"], 400)
+
+    print("\nparquet export")
+
+    def run_export(body):
+        job = call("/api/export", dict({"dataset_id": did}, **body))
+        deadline = time.time() + 180
+        while job.get("status") in ("queued", "counting", "running") and time.time() < deadline:
+            time.sleep(0.3)
+            job = call("/api/export/{}".format(job["id"]))
+        return job
+
+    def download(job, into):
+        target = os.path.join(into, job["filename"])
+        with urllib.request.urlopen(BASE + "/api/export/{}/download".format(job["id"])) as response, \
+                open(target, "wb") as handle:
+            handle.write(response.read())
+        return "read_parquet('{}')".format(target.replace("'", "''"))
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as scratch:
+        pq_filters = [{"column": "region", "op": "in", "values": ["north", "east"]},
+                      {"column": "amount", "op": "gte", "value": 500}]
+        job = run_export({"format": "parquet", "filters": pq_filters,
+                          "columns": ["id", "region", "amount", "created_at"],
+                          "order_by": "amount", "descending": True})
+        check("parquet export completes", job["status"], "done")
+        check("parquet file is named .parquet", job["filename"].endswith(".parquet"), True)
+        out = download(job, scratch)
+        want = con.sql("SELECT count(*) FROM {} WHERE region IN ('north','east') AND amount >= 500"
+                       .format(src)).fetchone()[0]
+        check("parquet holds every matching row ({:,})".format(want),
+              con.sql("SELECT count(*) FROM {}".format(out)).fetchone()[0], want)
+        check("parquet keeps only the chosen columns, in order",
+              [r[0] for r in con.sql("DESCRIBE SELECT * FROM {}".format(out)).fetchall()],
+              ["id", "region", "amount", "created_at"])
+        check("parquet keeps the source column types",
+              [r[1] for r in con.sql("DESCRIBE SELECT * FROM {}".format(out)).fetchall()],
+              [r[1] for r in con.sql("DESCRIBE SELECT id, region, amount, created_at FROM {}"
+                                     .format(src)).fetchall()])
+
+        limited = run_export({"format": "parquet", "filters": pq_filters, "columns": ["id", "amount"],
+                              "order_by": "amount", "descending": True, "row_limit": 25})
+        out = download(limited, scratch)
+        check("parquet honours the row limit",
+              con.sql("SELECT count(*) FROM {}".format(out)).fetchone()[0], 25)
+        check("and the limit takes the top rows of the sort",
+              con.sql("SELECT min(amount) FROM {}".format(out)).fetchone()[0],
+              con.sql("SELECT min(amount) FROM (SELECT amount FROM {} WHERE region IN ('north','east') "
+                      "AND amount >= 500 ORDER BY amount DESC LIMIT 25)".format(src)).fetchone()[0])
+
+        csv_job = run_export({"format": "csv", "filters": pq_filters, "row_limit": 10})
+        with urllib.request.urlopen(BASE + "/api/export/{}/download".format(csv_job["id"])) as response:
+            csv_lines = response.read().decode("utf-8").strip().splitlines()
+        check("csv honours the row limit too", len(csv_lines) - 1, 10)
 
     print("\npivot export")
     job = call("/api/pivot/export", {"dataset_id": did, "rows": ["region", "product"],

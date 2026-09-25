@@ -627,7 +627,11 @@ function openFilterPopover(column, anchor) {
 
   const tabs = tabsFor(column.category);
   const existingOp = pop.draft.op;
-  if (existingOp === 'in' || existingOp === 'not_in') pop.tab = 'values';
+  if ((existingOp === 'in' || existingOp === 'not_in') && pop.draft.list && tabs.includes('condition')) {
+    // A pasted list reopens as the text the user typed, not as ticked boxes.
+    pop.tab = 'condition';
+    pop.draft.value = (pop.draft.values || []).map(listToken).join(', ');
+  } else if (existingOp === 'in' || existingOp === 'not_in') pop.tab = 'values';
   else if (existingOp === 'between' || existingOp === 'not_between') pop.tab = tabs.includes('range') ? 'range' : 'condition';
   else if (existingOp) pop.tab = 'condition';
   else pop.tab = tabs[0];
@@ -892,19 +896,53 @@ async function loadStats() {
 
 /* -- condition tab -- */
 
+const LIST_OPS = ['in', 'not_in'];
+const NULLARY_OPS = ['is_null', 'is_not_null', 'is_empty', 'is_not_empty'];
+
 function opsFor(category) {
   const nullary = [['is_null', 'is blank'], ['is_not_null', 'is not blank']];
+  const list = [['in', 'is any of (list)'], ['not_in', 'is none of (list)']];
   if (category === 'numeric' || category === 'temporal') {
-    return [['eq', '='], ['ne', '≠'], ['gt', '>'], ['gte', '≥'], ['lt', '<'], ['lte', '≤'], ...nullary];
+    return [['eq', '='], ['ne', '≠'], ['gt', '>'], ['gte', '≥'], ['lt', '<'], ['lte', '≤'], ...list, ...nullary];
   }
   if (category === 'boolean') return [['eq', 'is'], ...nullary];
+  if (category === 'complex' || category === 'other') {
+    return [
+      ['contains', 'contains'], ['not_contains', 'does not contain'],
+      ['starts_with', 'starts with'], ['ends_with', 'ends with'],
+      ['eq', 'equals'], ['ne', 'does not equal'], ['regex', 'matches regex'],
+      ['is_empty', 'is empty'], ['is_not_empty', 'is not empty'], ...nullary,
+    ];
+  }
   return [
     ['contains', 'contains'], ['not_contains', 'does not contain'],
     ['starts_with', 'starts with'], ['ends_with', 'ends with'],
-    ['eq', 'equals'], ['ne', 'does not equal'], ['regex', 'matches regex'],
+    ['eq', 'equals'], ['ne', 'does not equal'], ...list, ['regex', 'matches regex'],
     ['is_empty', 'is empty'], ['is_not_empty', 'is not empty'], ...nullary,
   ];
 }
+
+/* Split pasted text into values. Commas, tabs and new lines all separate, so a
+   column copied out of a spreadsheet works as well as "a, b, c". Wrap a value
+   in double quotes to keep a comma inside it. Blanks and repeats are dropped. */
+function parseValueList(text) {
+  const out = [];
+  const seen = new Set();
+  const pattern = /"((?:[^"]|"")*)"|([^,\t\r\n]+)/g;
+  let match;
+  while ((match = pattern.exec(String(text ?? ''))) !== null) {
+    const value = (match[1] !== undefined ? match[1].replace(/""/g, '"') : match[2]).trim();
+    if (value === '' || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
+const listToken = (value) => {
+  const text = String(value ?? '');
+  return /[,"\t\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+};
 
 function renderConditionTab(body) {
   const options = opsFor(pop.column.category);
@@ -935,6 +973,25 @@ function renderConditionTab(body) {
   valueField.appendChild(input);
   body.appendChild(valueField);
 
+  const listField = el('label', 'field');
+  const listHint = el('em', null, '');
+  const listLabel = el('span', null, 'Values ');
+  listLabel.appendChild(listHint);
+  listField.appendChild(listLabel);
+  const listBox = el('textarea', 'input list-input');
+  listBox.rows = 5;
+  listBox.spellcheck = false;
+  listBox.placeholder = isDate
+    ? 'Paste values separated by commas or new lines\ne.g. 2024-01-31, 2024-02-29'
+    : 'Paste values separated by commas or new lines\ne.g. north, south, east';
+  const countList = () => {
+    const n = parseValueList(listBox.value).length;
+    listHint.textContent = n ? `— ${fmtNum(n)} value${n === 1 ? '' : 's'}` : '— comma or line separated';
+  };
+  listBox.oninput = () => { pop.draft.value = listBox.value; countList(); };
+  listField.appendChild(listBox);
+  body.appendChild(listField);
+
   let caseBox = null;
   if (['text', 'complex', 'other'].includes(pop.column.category)) {
     const wrap = el('label', 'check');
@@ -947,14 +1004,35 @@ function renderConditionTab(body) {
   }
 
   const syncVisibility = () => {
-    const needsValue = !['is_null', 'is_not_null', 'is_empty', 'is_not_empty'].includes(select.value);
-    valueField.style.display = needsValue ? '' : 'none';
+    const isList = LIST_OPS.includes(select.value);
+    const needsValue = !NULLARY_OPS.includes(select.value);
+    valueField.style.display = needsValue && !isList ? '' : 'none';
+    listField.style.display = isList ? '' : 'none';
     if (caseBox) {
       caseBox.parentElement.style.display =
-        ['contains', 'not_contains', 'starts_with', 'ends_with'].includes(select.value) ? '' : 'none';
+        ['contains', 'not_contains', 'starts_with', 'ends_with', ...LIST_OPS].includes(select.value) ? '' : 'none';
     }
   };
-  select.onchange = () => { pop.draft.op = select.value; syncVisibility(); };
+  select.onchange = () => {
+    const wasList = LIST_OPS.includes(pop.draft.op);
+    pop.draft.op = select.value;
+    // Carry whatever was typed across when switching between one value and a list.
+    if (LIST_OPS.includes(select.value) && !wasList) {
+      listBox.value = input.value;
+      pop.draft.value = listBox.value;
+    } else if (!LIST_OPS.includes(select.value) && wasList) {
+      const first = parseValueList(listBox.value)[0] ?? '';
+      input.value = toInputValue(first, isDate);
+      input.oninput();
+    }
+    countList();
+    syncVisibility();
+  };
+  if (LIST_OPS.includes(current)) {
+    listBox.value = pop.draft.value ?? '';
+    input.value = '';
+  }
+  countList();
   pop.draft.op = current;
   syncVisibility();
 
@@ -976,6 +1054,8 @@ function applyFilter() {
     draft.values = [...pop.selected].map((key) => JSON.parse(key));
     delete draft.value;
     delete draft.value2;
+    delete draft.list;
+    delete draft.case_sensitive;
     if (!draft.values.length) {
       showPopError('Select at least one value, or clear the filter.');
       return;
@@ -992,9 +1072,34 @@ function applyFilter() {
       if (isBareDate(draft.value)) draft.value = dayStart(draft.value);
       if (isBareDate(draft.value2)) draft.value2 = dayEnd(draft.value2);
     }
+  } else if (LIST_OPS.includes(draft.op)) {
+    const values = parseValueList(draft.value);
+    if (!values.length) {
+      showPopError('Paste at least one value, separated by commas or new lines.');
+      return;
+    }
+    if (column.category === 'numeric') {
+      const bad = values.filter((v) => !Number.isFinite(Number(v)));
+      if (bad.length) {
+        showPopError(`Not a number: ${bad.slice(0, 5).join(', ')}${bad.length > 5 ? ` +${bad.length - 5} more` : ''}`);
+        return;
+      }
+    }
+    if (isTimestampColumn(column) && values.some(isBareDate)) {
+      // A bare date would only match rows stamped exactly at midnight.
+      showPopError('This column holds timestamps — paste full values (2024-01-31 14:05:00) or use the Range tab.');
+      return;
+    }
+    draft.values = column.category === 'numeric' ? values.map(Number) : values;
+    draft.list = true;
+    if (column.category === 'text') draft.case_sensitive = Boolean(draft.case_sensitive);
+    else delete draft.case_sensitive;
+    delete draft.value;
+    delete draft.value2;
   } else {
     delete draft.values;
     delete draft.value2;
+    delete draft.list;
     const nullary = ['is_null', 'is_not_null', 'is_empty', 'is_not_empty'].includes(draft.op);
     if (!nullary && (draft.value === null || draft.value === undefined || draft.value === '')) {
       showPopError('Enter a value for this condition.');
