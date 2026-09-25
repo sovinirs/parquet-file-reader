@@ -138,7 +138,7 @@ class ExportRequest(BaseModel):
 
 def _load_recents() -> List[Dict[str, Any]]:
     try:
-        with open(RECENTS_FILE, "r") as handle:
+        with open(RECENTS_FILE, "r", encoding="utf-8") as handle:
             data = json.load(handle)
         return [r for r in data if isinstance(r, dict) and os.path.exists(r.get("path", ""))]
     except (OSError, ValueError):
@@ -149,7 +149,7 @@ def _remember(path: str, name: str, rows: int) -> None:
     recents = [r for r in _load_recents() if r.get("path") != path]
     recents.insert(0, {"path": path, "name": name, "rows": rows})
     try:
-        with open(RECENTS_FILE, "w") as handle:
+        with open(RECENTS_FILE, "w", encoding="utf-8") as handle:
             json.dump(recents[:MAX_RECENTS], handle, indent=2)
     except OSError:
         pass
@@ -311,7 +311,7 @@ def _guard(fn, *args, **kwargs):
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> HTMLResponse:
-    with open(os.path.join(STATIC_DIR, "index.html"), "r") as handle:
+    with open(os.path.join(STATIC_DIR, "index.html"), "r", encoding="utf-8") as handle:
         page = handle.read()
     # Stamp each asset URL with the file's mtime. Without it a browser that has
     # app.js cached will happily pair an old script with a new index.html --
