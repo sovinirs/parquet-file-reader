@@ -1088,6 +1088,12 @@ a.btn { display: inline-flex; align-items: center; justify-content: center; }
 }
 .pivot-grid tbody tr:hover td { background: var(--surface-hover); }
 .pivot-grid tbody td.blank { color: var(--text-faint); }
+/* A large pivot draws only the rows in view: widths are fixed up front so the
+   columns hold still as rows are swapped, and spacer rows stand in for the rest. */
+.pivot-grid.virtual { table-layout: fixed; min-width: 0; }
+.pivot-grid.virtual thead th, .pivot-grid.virtual tbody td { overflow: hidden; text-overflow: ellipsis; }
+.pivot-grid tbody tr.pv-spacer td,
+.pivot-grid tbody tr.pv-spacer:hover td { padding: 0; border: 0; background: transparent; }
 
 .pivot-note { font-size: 11.5px; color: var(--warn); }
 
@@ -1220,3 +1226,18 @@ a.btn { display: inline-flex; align-items: center; justify-content: center; }
 .loader-text { flex: 1; min-width: 0; }
 .loader-secs { font-size: 11.5px; color: var(--text-faint); }
 .loader-card .progress-track { margin-top: 12px; }
+
+/* pivot: built on demand */
+.btn.primary.pulse { box-shadow: 0 0 0 3px var(--accent-soft); animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { box-shadow: 0 0 0 6px var(--accent-soft); } }
+.table-wrap.stale #pivot-grid { opacity: .45; transition: opacity .15s; }
+.pivot-stale { color: var(--accent-text); font-weight: 600; }
+.loader-detail {
+  font-size: 12px; color: var(--text-dim); line-height: 1.5;
+  margin: -4px 0 12px 26px; overflow-wrap: anywhere;
+}
+.loader-foot { display: flex; justify-content: flex-end; margin-top: 12px; }
+.btn.small { padding: 4px 10px; font-size: 12px; }
+/* The pivot toolbar wraps rather than push Run pivot off the edge. */
+.pivot-toolbar { flex-wrap: wrap; row-gap: 8px; }
+.pivot-toolbar .toolbar-right { flex-wrap: wrap; justify-content: flex-end; row-gap: 8px; margin-left: auto; }

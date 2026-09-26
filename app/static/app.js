@@ -45,6 +45,7 @@ function newPivotState() {
     repeatLabels: false,
     sort: null,          // { by: 'value', value_index, descending }
     result: null,
+    ranSignature: null,  // the settings `result` was built from; differs once they change
     error: null,
     ms: 0,
     token: 0,
@@ -293,11 +294,27 @@ const visibleColumns = () =>
 /* -- the loader: what the backend is doing while a file opens -- */
 
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/* Let the browser paint once (so the loader's latest step shows) before a long
+   synchronous job. A hidden tab never fires animation frames, so a timer backs it up. */
+function nextFrame() {
+  return new Promise((resolve) => {
+    let done = false;
+    const go = () => { if (!done) { done = true; resolve(); } };
+    requestAnimationFrame(() => setTimeout(go, 0));
+    setTimeout(go, 50);
+  });
+}
 // Opening a small file takes milliseconds; only show the loader when it doesn't.
 const LOADER_DELAY_MS = 200;
 
-function renderLoader(title, steps, { elapsed = null, done = false, percent = null } = {}) {
+function renderLoader(title, steps, { elapsed = null, done = false, percent = null, detail = null,
+                                      onCancel = null } = {}) {
   $('loader-title').textContent = title;
+  $('loader-detail').hidden = !detail;
+  $('loader-detail').textContent = detail || '';
+  $('loader-foot').hidden = !onCancel;
+  $('loader-cancel').onclick = onCancel;
   $('loader-time').textContent = elapsed === null ? '' : `${elapsed.toFixed(1)}s`;
   const list = $('loader-steps');
   list.innerHTML = '';
@@ -670,9 +687,9 @@ async function refresh({ countUnchanged = false } = {}) {
   }
 
   if (state.mode === 'pivot') {
-    // The cross-tab is its own aggregate query; the row grid stays untouched
-    // until the Data view is shown again.
-    runPivot();
+    // The cross-tab is its own aggregate query, run on demand: a filter change
+    // leaves it marked out of date until Run pivot is pressed.
+    markPivotChanged();
     return;
   }
 
@@ -2006,7 +2023,7 @@ function fieldChip(well, item, index) {
     wellItems(well).splice(index, 1);
     if (well === 'values' && state.pivot.sort) state.pivot.sort = null;
     renderWells();
-    runPivot();
+    markPivotChanged();
   };
 
   chip.append(name, caret, remove);
@@ -2043,7 +2060,7 @@ function openChipMenu(anchor, well, index) {
           label: agg.label,
           on: agg.id === item.agg,
           disabled: !aggAllowed(agg, category),
-          onSelect: () => { item.agg = agg.id; renderWells(); runPivot(); },
+          onSelect: () => { item.agg = agg.id; renderWells(); markPivotChanged(); },
         })),
       });
     }
@@ -2085,7 +2102,7 @@ function openChipMenu(anchor, well, index) {
     onSelect: () => {
       wellItems(well).splice(index, 1);
       renderWells();
-      runPivot();
+      markPivotChanged();
     },
   });
   sections.push({ title: well === 'values' ? 'Field' : item, items: moves });
@@ -2105,7 +2122,7 @@ function moveField(well, from, to) {
   items.splice(to, 0, items.splice(from, 1)[0]);
   if (well === 'values' && state.pivot.sort) state.pivot.sort = null;
   renderWells();
-  runPivot();
+  markPivotChanged();
 }
 
 /* Moving a field between wells has to translate it: the Values well holds
@@ -2145,7 +2162,7 @@ function addToWell(well, columnName, at = null) {
   }
   state.pivot.sort = null;
   renderWells();
-  runPivot();
+  markPivotChanged();
 }
 
 /* -- drag and drop -- */
@@ -2226,45 +2243,136 @@ function showPivotPlaceholder(title, detail) {
   node.hidden = false;
 }
 
+/* What a run depends on. Repeat labels is left out: it only redraws. */
+function pivotSignature(payload = pivotPayload()) {
+  const { repeat_labels: _ignored, ...rest } = payload;
+  return JSON.stringify(rest);
+}
+
+const pivotIsStale = () => !pivotIsEmpty() && pivotSignature() !== state.pivot.ranSignature;
+
+/* The fields or options changed: nothing is fetched until Run pivot, so a
+   pivot with several measures is built once, not once per field dropped in. */
+function markPivotChanged() {
+  if (!state.dataset) return;
+  if (pivotIsEmpty() && state.pivot.result) {
+    // Nothing left to show -- clear it rather than leave a stale table up.
+    runPivot();
+    return;
+  }
+  syncPivotRun();
+  renderPivotReadout();
+  if (!state.pivot.result) {
+    showPivotPlaceholder(
+      pivotIsEmpty() ? undefined : 'Ready to run',
+      pivotIsEmpty() ? undefined
+        : 'Add any other fields you want, then press Run pivot (Ctrl+Enter) to build it.');
+  }
+}
+
+function syncPivotRun() {
+  const empty = pivotIsEmpty();
+  const stale = pivotIsStale();
+  const run = $('btn-pivot-run');
+  run.disabled = empty;
+  run.classList.toggle('pulse', stale);
+  run.title = empty ? 'Add a field to Rows or Columns, and one to Values'
+    : 'Build the pivot with these fields (Ctrl+Enter)';
+  $('pivot-wrap').classList.toggle('stale', Boolean(state.pivot.result) && stale);
+  // An export is built from the settings, so it must match the table shown.
+  $('btn-pivot-export').disabled = !state.pivot.result || stale;
+  $('btn-pivot-export').title = stale && state.pivot.result ? 'Run the pivot first, so the export matches it' : '';
+}
+
+/* One line saying what is about to be built, for the loader. */
+function describePivotRun(payload) {
+  const parts = [];
+  if (payload.rows.length) parts.push(`Rows: ${payload.rows.join(' › ')}`);
+  if (payload.columns.length) parts.push(`Columns: ${payload.columns.join(' › ')}`);
+  parts.push(`Values: ${state.pivot.values.map(valueChipLabel).join(', ')}`);
+  const filters = payload.filters.length;
+  const rows = state.matched === null ? state.dataset.row_count : state.matched;
+  parts.push(`${fmtNum(rows)} rows${filters ? ` after ${filters} filter${filters === 1 ? '' : 's'}` : ''}`);
+  return parts.join(' · ');
+}
+
 async function runPivot() {
   if (!state.dataset || state.mode !== 'pivot') return;
   const pivotState = state.pivot;
   await loadAggregations();
 
   if (pivotIsEmpty()) {
+    pivotState.token += 1;
     pivotState.result = null;
     pivotState.error = null;
+    pivotState.ranSignature = null;
+    pivotView = null;
     $('pivot-head').innerHTML = '';
     $('pivot-body').innerHTML = '';
     showPivotPlaceholder();
     $('pivot-overlay').hidden = true;
     renderPivotReadout();
+    syncPivotRun();
     return;
   }
 
   const token = ++pivotState.token;
-  $('pivot-overlay').hidden = false;
-  $('pivot-empty').hidden = true;
+  const payload = pivotPayload();
+  const signature = pivotSignature(payload);
+  const detail = describePivotRun(payload);
+  const title = 'Building the pivot';
   const started = performance.now();
+  const elapsed = () => (performance.now() - started) / 1000;
+  // Cancel stops waiting and keeps whatever was on screen before.
+  const cancel = () => {
+    pivotState.token += 1;
+    clearTimeout(timer);
+    hideLoader();
+    $('btn-pivot-run').disabled = false;
+    toast('Pivot cancelled — the table shows the previous run.');
+  };
+  const timer = setTimeout(showLoader, LOADER_DELAY_MS);
+  $('btn-pivot-run').disabled = true;
+  renderLoader(title, [{ message: 'Sending the pivot to the server…' }], { elapsed: 0, detail, onCancel: cancel });
 
   try {
-    const result = await api('/api/pivot', pivotPayload());
+    let job = await api('/api/pivot/start', payload);
+    while (job.status === 'running') {
+      if (token !== pivotState.token) return;
+      renderLoader(title, job.steps, { elapsed: elapsed(), detail, onCancel: cancel });
+      await pause(120);
+      job = await api(`/api/pivot/job/${job.id}`, undefined, 'GET');
+    }
+    if (token !== pivotState.token) return;
+    if (job.status === 'error') throw new Error(job.error || 'The pivot could not be built');
+
+    const result = job.result;
+    // Drawing is the browser's step; say so, and give the loader a frame to show it.
+    renderLoader(title, [...job.steps, { message: `Drawing ${fmtNum(result.rows.length)} rows…` }],
+                 { elapsed: elapsed(), detail });
+    await nextFrame();
     if (token !== pivotState.token) return;
     pivotState.result = result;
     pivotState.error = null;
+    pivotState.ranSignature = signature;
     pivotState.ms = performance.now() - started;
     renderPivotGrid(result);
   } catch (error) {
     if (token !== pivotState.token) return;
     pivotState.result = null;
     pivotState.error = error.message;
+    pivotState.ranSignature = null;
+    pivotView = null;
     $('pivot-head').innerHTML = '';
     $('pivot-body').innerHTML = '';
     showPivotPlaceholder('This pivot cannot be built', error.message);
   } finally {
     if (token === pivotState.token) {
+      clearTimeout(timer);
+      hideLoader();
       $('pivot-overlay').hidden = true;
       renderPivotReadout();
+      syncPivotRun();
     }
   }
 }
@@ -2370,6 +2478,7 @@ function renderPivotGrid(result) {
   const fieldRow = el('tr');
   for (let index = 0; index < labelCount; index += 1) {
     const th = el('th', 'rl field-name', rowFields[index] || '');
+    th.dataset.labelIndex = String(index);
     th.style.left = `${index * PIVOT_LABEL_WIDTH}px`;
     th.style.top = `${result.header.length * PIVOT_HEADER_ROW_HEIGHT}px`;
     th.style.minWidth = `${PIVOT_LABEL_WIDTH}px`;
@@ -2381,40 +2490,182 @@ function renderPivotGrid(result) {
   fieldRow.appendChild(filler);
   head.appendChild(fieldRow);
 
-  const integral = integralLeaves(result);
-  const repeatLabels = state.pivot.repeatLabels;
-  let previous = [];
-  for (const record of result.rows) {
-    const tr = el('tr', record.kind === 'data' ? null : record.kind);
-    for (let index = 0; index < labelCount; index += 1) {
-      const text = record.labels[index] === undefined ? '' : record.labels[index];
-      // Repeat an outer label only when it changes, the way Excel does -- unless
-      // "Repeat labels" is on, which prints it on every row so each one stands alone.
-      const repeated = !repeatLabels && record.kind === 'data'
-        && index < labelCount - 1 && previous[index] === text;
-      const td = el('td', 'rl', repeated ? '' : text);
-      td.style.left = `${index * PIVOT_LABEL_WIDTH}px`;
-      td.style.minWidth = `${PIVOT_LABEL_WIDTH}px`;
-      td.title = text;
-      tr.appendChild(td);
-    }
-    previous = record.kind === 'data' ? record.labels : [];
+  const context = {
+    labelCount,
+    leaves,
+    integral: integralLeaves(result),
+    repeatLabels: state.pivot.repeatLabels,
+    lefts: Array.from({ length: labelCount }, (_, index) => index * PIVOT_LABEL_WIDTH),
+    widths: Array(labelCount).fill(PIVOT_LABEL_WIDTH),
+  };
 
-    record.cells.forEach((value, index) => {
-      const leaf = leaves[index];
-      const td = el('td', `num${leaf && leaf.kind === 'total' ? ' total-col' : ''}`);
-      if (value === null || value === undefined) {
-        td.classList.add('blank');
-        td.textContent = '–';
-      } else {
-        td.textContent = fmtPivotCell(value, integral[index]);
-      }
-      tr.appendChild(td);
+  const table = $('pivot-grid');
+  const wrap = $('pivot-wrap');
+  const virtual = result.rows.length > PIVOT_FULL_RENDER_ROWS;
+  table.classList.toggle('virtual', virtual);
+  table.querySelector('colgroup')?.remove();
+  table.style.width = '';
+
+  if (!virtual) {
+    pivotView = null;
+    wrap.onscroll = null;
+    const fragment = document.createDocumentFragment();
+    result.rows.forEach((_, index) => fragment.appendChild(pivotRowElement(result, index, context)));
+    body.appendChild(fragment);
+  } else {
+    // Thousands of rows: lay the columns out once, then only ever put the
+    // rows in view into the page (see paintPivotWindow).
+    fixPivotColumns(result, context, table);
+    head.querySelectorAll('th.rl').forEach((th) => {
+      const index = Number(th.dataset.labelIndex || 0);
+      th.style.left = `${context.lefts[index]}px`;
     });
-    body.appendChild(tr);
+    pivotView = { result, context, rowHeight: PIVOT_ROW_HEIGHT, start: -1, end: -1 };
+    wrap.onscroll = () => {
+      if (pivotView && !pivotView.queued) {
+        pivotView.queued = true;
+        requestAnimationFrame(() => { if (pivotView) { pivotView.queued = false; paintPivotWindow(); } });
+      }
+    };
+    paintPivotWindow(true);
   }
 
   renderPivotReadout();
+}
+
+/* One pivot body row. `previous` for the repeated-label rule is the row above
+   in the whole result, not in the page, so a virtual window starts right. */
+function pivotRowElement(result, index, context) {
+  const record = result.rows[index];
+  const above = index > 0 ? result.rows[index - 1] : null;
+  const previous = above && above.kind === 'data' ? above.labels : [];
+  const tr = el('tr', record.kind === 'data' ? null : record.kind);
+  for (let at = 0; at < context.labelCount; at += 1) {
+    const text = record.labels[at] === undefined ? '' : record.labels[at];
+    // Repeat an outer label only when it changes, the way Excel does -- unless
+    // "Repeat labels" is on, which prints it on every row so each one stands alone.
+    const repeated = !context.repeatLabels && record.kind === 'data'
+      && at < context.labelCount - 1 && previous[at] === text;
+    const td = el('td', 'rl', repeated ? '' : text);
+    td.style.left = `${context.lefts[at]}px`;
+    td.style.minWidth = `${context.widths[at]}px`;
+    td.title = text;
+    tr.appendChild(td);
+  }
+  record.cells.forEach((value, at) => {
+    const leaf = context.leaves[at];
+    const td = el('td', `num${leaf && leaf.kind === 'total' ? ' total-col' : ''}`);
+    if (value === null || value === undefined) {
+      td.classList.add('blank');
+      td.textContent = '–';
+    } else {
+      td.textContent = fmtPivotCell(value, context.integral[at]);
+    }
+    tr.appendChild(td);
+  });
+  return tr;
+}
+
+/* Up to this many rows the pivot is simply drawn. Beyond it the browser would
+   spend seconds laying out every cell (20,000 rows took ~9s), so only the rows
+   in view are put in the page and they are swapped as it scrolls. */
+const PIVOT_FULL_RENDER_ROWS = 400;
+const PIVOT_ROW_HEIGHT = 29;      // must match .pivot-grid.virtual tbody tr
+const PIVOT_ROW_BUFFER = 30;      // rows drawn above and below the view
+let pivotView = null;
+
+/* Fixed column widths, measured once from every row, so columns do not jump
+   as different rows scroll into view. */
+function fixPivotColumns(result, context, table) {
+  const canvas = fixPivotColumns.canvas || (fixPivotColumns.canvas = document.createElement('canvas'));
+  const ctx = canvas.getContext('2d');
+  const fontOf = (selector, fallback) => {
+    const probe = el('td', selector);
+    probe.textContent = '0';
+    $('pivot-body').appendChild(probe);
+    const style = getComputedStyle(probe);
+    const font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}` || fallback;
+    probe.remove();
+    return font;
+  };
+  const numFont = fontOf('num', '12.5px monospace');
+  const labelFont = fontOf('rl', '12.5px sans-serif');
+  const padding = 24;               // 10px either side, plus the border
+
+  // The longest text per column is found by length first (cheap), then measured.
+  const longest = (texts) => texts.reduce((best, text) => (text.length > best.length ? text : best), '');
+  const labelWidths = [];
+  for (let at = 0; at < context.labelCount; at += 1) {
+    const text = longest(result.rows.map((r) => String(r.labels[at] ?? '')));
+    ctx.font = labelFont;
+    labelWidths.push(Math.min(360, Math.max(PIVOT_LABEL_WIDTH, Math.ceil(ctx.measureText(text).width) + padding)));
+  }
+  const leafWidths = context.leaves.map((leaf, at) => {
+    const cells = result.rows.map((r) => {
+      const value = r.cells[at];
+      return value === null || value === undefined ? '–' : fmtPivotCell(value, context.integral[at]);
+    });
+    ctx.font = numFont;
+    const data = Math.ceil(ctx.measureText(longest(cells)).width);
+    ctx.font = `600 ${labelFont.split(' ').slice(1).join(' ')}`;
+    const header = Math.ceil(ctx.measureText(leaf.label || '').width);
+    return Math.max(72, Math.max(data, header) + padding);
+  });
+
+  context.widths = labelWidths;
+  context.lefts = labelWidths.map((_, at) => labelWidths.slice(0, at).reduce((a, b) => a + b, 0));
+  const colgroup = el('colgroup');
+  for (const width of [...labelWidths, ...leafWidths]) {
+    const col = el('col');
+    col.style.width = `${width}px`;
+    colgroup.appendChild(col);
+  }
+  table.insertBefore(colgroup, table.firstChild);
+  table.style.width = `${[...labelWidths, ...leafWidths].reduce((a, b) => a + b, 0)}px`;
+}
+
+/* Put the rows in view (plus a buffer) into the page, with spacer rows standing
+   in for everything above and below so the scrollbar still spans the pivot. */
+function paintPivotWindow(force = false) {
+  const view = pivotView;
+  if (!view) return;
+  const wrap = $('pivot-wrap');
+  const total = view.result.rows.length;
+  const headHeight = $('pivot-head').offsetHeight;
+  const firstVisible = Math.floor(Math.max(0, wrap.scrollTop - headHeight) / view.rowHeight);
+  const visible = Math.ceil(wrap.clientHeight / view.rowHeight) + 1;
+  const start = Math.max(0, firstVisible - PIVOT_ROW_BUFFER);
+  const end = Math.min(total, firstVisible + visible + PIVOT_ROW_BUFFER);
+  // Redraw only once the view has moved well into the buffer.
+  if (!force && start >= view.start && end <= view.end
+      && firstVisible - view.start > PIVOT_ROW_BUFFER / 3
+      && view.end - (firstVisible + visible) > PIVOT_ROW_BUFFER / 3) return;
+
+  const body = $('pivot-body');
+  const spacer = (height) => {
+    const tr = el('tr', 'pv-spacer');
+    const td = el('td');
+    td.colSpan = view.context.labelCount + view.context.leaves.length;
+    td.style.height = `${height}px`;
+    tr.appendChild(td);
+    return tr;
+  };
+  const fragment = document.createDocumentFragment();
+  fragment.appendChild(spacer(start * view.rowHeight));
+  for (let index = start; index < end; index += 1) {
+    fragment.appendChild(pivotRowElement(view.result, index, view.context));
+  }
+  fragment.appendChild(spacer((total - end) * view.rowHeight));
+  body.replaceChildren(fragment);
+  view.start = start;
+  view.end = end;
+
+  // Trust the browser over the constant: if a real row is taller, re-measure.
+  const sample = body.children[1];
+  if (sample && sample.offsetHeight && Math.abs(sample.offsetHeight - view.rowHeight) > 0.5) {
+    view.rowHeight = sample.offsetHeight;
+    paintPivotWindow(true);
+  }
 }
 
 function cyclePivotSort(valueIndex) {
@@ -2433,14 +2684,13 @@ function renderPivotReadout() {
     readout.appendChild(el('span', 'counting',
       pivotIsEmpty()
         ? 'Add a field to Rows (or Columns) and one to Values.'
-        : (state.pivot.error || 'Building…')));
+        : (state.pivot.error || 'Ready — press Run pivot to build it.')));
     $('pivot-status-left').textContent = '';
     $('pivot-status-right').textContent = '';
-    $('btn-pivot-export').disabled = true;
+    syncPivotRun();
     return;
   }
 
-  $('btn-pivot-export').disabled = false;
   readout.appendChild(el('b', null, fmtNum(result.total_row_groups)));
   readout.appendChild(document.createTextNode(
     ` row group${result.total_row_groups === 1 ? '' : 's'}`));
@@ -2459,6 +2709,12 @@ function renderPivotReadout() {
     readout.appendChild(el('span', 'pivot-note',
       'too many groups to rank them all — this sorts the groups shown'));
   }
+
+  if (pivotIsStale()) {
+    readout.appendChild(document.createTextNode(' · '));
+    readout.appendChild(el('span', 'pivot-stale', 'Fields changed — press Run pivot to update'));
+  }
+  syncPivotRun();
 
   const source = state.matched === null ? state.dataset.row_count : state.matched;
   $('pivot-status-left').textContent =
@@ -2490,7 +2746,7 @@ function openAddMenu(anchor, well) {
           onSelect: () => {
             state.pivot.values.push({ column: null, agg: 'count_rows' });
             renderWells();
-            runPivot();
+            markPivotChanged();
           },
         }],
       });
@@ -2505,7 +2761,7 @@ function swapPivotAxes() {
   state.pivot.columns = rows;
   state.pivot.sort = null;
   renderWells();
-  runPivot();
+  markPivotChanged();
 }
 
 function clearPivot() {
@@ -2538,7 +2794,7 @@ function wirePivot() {
   }
 
   const toggle = (id, key) => {
-    $(id).onchange = () => { state.pivot[key] = $(id).checked; runPivot(); };
+    $(id).onchange = () => { state.pivot[key] = $(id).checked; markPivotChanged(); };
   };
   toggle('opt-subtotals', 'subtotals');
   toggle('opt-row-totals', 'rowTotals');
@@ -2551,6 +2807,7 @@ function wirePivot() {
     if (state.pivot.result) renderPivotGrid(state.pivot.result);
   };
 
+  $('btn-pivot-run').onclick = () => runPivot();
   $('btn-pivot-swap').onclick = swapPivotAxes;
   $('btn-pivot-clear').onclick = clearPivot;
   $('btn-pivot-export').onclick = openDrawer;
@@ -2673,6 +2930,12 @@ function wire() {
   });
 
   document.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && state.mode === 'pivot'
+        && !pivotIsEmpty() && $('popover').hidden) {
+      event.preventDefault();
+      runPivot();
+      return;
+    }
     if (event.key === 'Escape') {
       if (!$('menu').hidden) closeMenu();
       else if (!$('popover').hidden) closePopover();

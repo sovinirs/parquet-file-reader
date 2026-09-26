@@ -142,12 +142,37 @@ async function until(fn, ms = 6000) {
        AGGS ? AGGS.map(a => a.id).join(',') : 'none');
     ok('empty pivot shows the placeholder', !document.getElementById('pivot-empty').hidden);
 
+    // The pivot is built on demand: count how many times it is asked for.
+    const runButton = document.getElementById('btn-pivot-run');
+    const run = () => runButton.click();
+    let pivotRequests = 0;
+    const realFetch = window.fetch;
+    window.fetch = (url, ...rest) => {
+      if (String(url).includes('/api/pivot/start')) pivotRequests += 1;
+      return realFetch(url, ...rest);
+    };
+    ok('Run pivot is disabled while the pivot is empty', runButton.disabled);
+
     addToWell('rows', 'region');
     addToWell('columns', 'status');
     addToWell('values', 'amount');
     ok('a numeric field defaults to Sum', state.pivot.values[0].agg === 'sum');
     ok('wells render chips', document.querySelectorAll('#pivot-builder .field-chip').length === 3);
+    await sleep(500);
+    ok('adding fields does not build the pivot', !state.pivot.result && pivotRequests === 0,
+       `${pivotRequests} requests`);
+    ok('Run pivot is ready once there is something to build',
+       !runButton.disabled && runButton.classList.contains('pulse'));
+    ok('the placeholder says to press Run pivot',
+       /Ready to run/.test(document.getElementById('pivot-empty').textContent));
+    run();
     await until(() => state.pivot.result, 20000);
+    ok('Run pivot builds it with one request', pivotRequests === 1, `${pivotRequests} requests`);
+    ok('the loader narrated the build', /Aggregating every matching row/.test(
+       document.getElementById('loader-steps').textContent), document.getElementById('loader-steps').textContent);
+    ok('the loader is gone afterwards', document.getElementById('open-loader').hidden);
+    ok('a fresh pivot is not marked out of date',
+       !runButton.classList.contains('pulse') && !document.getElementById('pivot-wrap').classList.contains('stale'));
 
     let result = state.pivot.result;
     ok('4 status columns plus a Total', result.leaves.length === 5,
@@ -169,6 +194,12 @@ async function until(fn, ms = 6000) {
 
     // a second row field brings subtotals with it
     addToWell('rows', 'product');
+    ok('a changed pivot is dimmed and flagged, not rebuilt',
+       document.getElementById('pivot-wrap').classList.contains('stale')
+       && runButton.classList.contains('pulse') && state.pivot.result.row_fields.length === 1);
+    ok('its export waits for a run', document.getElementById('btn-pivot-export').disabled);
+    ok('the readout says to run it', /press Run pivot/.test(document.getElementById('pivot-readout').textContent));
+    run();
     await until(() => state.pivot.result && state.pivot.result.row_fields.length === 2, 20000);
     result = state.pivot.result;
     ok('30 detail rows for 5 regions x 6 products',
@@ -177,9 +208,16 @@ async function until(fn, ms = 6000) {
     ok('subtotal is labelled like Excel', /Total$/.test(result.rows[6].labels[0]), result.rows[6].labels[0]);
 
     // a second measure widens every column group
+    const requestsBefore = pivotRequests;
     addToWell('values', 'id');
     state.pivot.values[1].agg = 'count';
+    addToWell('values', 'quantity');
+    state.pivot.values.pop();
+    markPivotChanged();
+    run();
     await until(() => state.pivot.result && state.pivot.result.values.length === 2, 20000);
+    ok('several field changes cost one pivot request', pivotRequests - requestsBefore === 1,
+       `${pivotRequests - requestsBefore} requests`);
     result = state.pivot.result;
     ok('two measures double the leaf columns', result.leaves.length === 10, `${result.leaves.length} leaves`);
     ok('measure labels appear as a header level', result.header.length === 2, `${result.header.length} levels`);
@@ -189,11 +227,13 @@ async function until(fn, ms = 6000) {
     // turning subtotals off removes exactly those rows
     document.getElementById('opt-subtotals').checked = false;
     document.getElementById('opt-subtotals').onchange();
+    run();
     await until(() => state.pivot.result && !state.pivot.result.rows.some(r => r.kind === 'subtotal'), 20000);
     ok('subtotals can be switched off',
        state.pivot.result.rows.filter(r => r.kind === 'data').length === 30);
     document.getElementById('opt-subtotals').checked = true;
     document.getElementById('opt-subtotals').onchange();
+    run();
     await until(() => state.pivot.result && state.pivot.result.rows.some(r => r.kind === 'subtotal'), 20000);
 
     // repeating the labels fills in the outer label column on every detail row
@@ -216,10 +256,12 @@ async function until(fn, ms = 6000) {
 
     // swapping the axes moves the fields across
     document.getElementById('btn-pivot-swap').click();
+    run();
     await until(() => state.pivot.result && state.pivot.result.column_fields.length === 2, 20000);
     ok('swap moves rows to columns and back',
        state.pivot.rows.join(',') === 'status' && state.pivot.columns.join(',') === 'region,product');
     document.getElementById('btn-pivot-swap').click();
+    run();
     await until(() => state.pivot.result && state.pivot.result.row_fields.length === 2, 20000);
 
     // sorting by a measure (wait for the *next* result, not the one on screen)
@@ -237,12 +279,17 @@ async function until(fn, ms = 6000) {
     // filters still apply to the pivot
     state.filters['region'] = { column: 'region', op: 'in', values: ['north'] };
     renderChips(); await refresh();
+    ok('a new filter marks the pivot out of date', pivotIsStale());
+    run();
     await until(() => state.pivot.result && state.pivot.result.total_row_groups === 6, 20000);
     ok('an active filter narrows the pivot', state.pivot.result.total_row_groups === 6,
        `${state.pivot.result.total_row_groups} row groups`);
     delete state.filters['region'];
     renderChips(); await refresh();
+    run();
     await until(() => state.pivot.result && state.pivot.result.total_row_groups === 30, 20000);
+
+    window.fetch = realFetch;
 
     // --- export the pivot to Excel ---
     document.getElementById('btn-pivot-export').click();

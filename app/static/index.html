@@ -186,7 +186,8 @@
           <label class="check tight" title="Print the outer row labels on every row instead of only the first of each group"><input type="checkbox" id="opt-repeat-labels" /><span>Repeat labels</span></label>
           <button class="btn" id="btn-pivot-swap" title="Swap the Rows and Columns fields">⇄ Swap</button>
           <button class="btn" id="btn-pivot-clear">Clear</button>
-          <button class="btn primary" id="btn-pivot-export">Export to Excel</button>
+          <button class="btn" id="btn-pivot-export">Export to Excel</button>
+          <button class="btn primary" id="btn-pivot-run" title="Build the pivot with these fields (Ctrl+Enter)">▶ Run pivot</button>
         </div>
       </div>
 
@@ -323,8 +324,12 @@
       <b id="loader-title">Opening…</b>
       <span class="loader-time mono" id="loader-time"></span>
     </div>
+    <div class="loader-detail" id="loader-detail" hidden></div>
     <ol class="loader-steps" id="loader-steps"></ol>
     <div class="progress-track" id="loader-track" hidden><div class="progress-fill" id="loader-fill"></div></div>
+    <div class="loader-foot" id="loader-foot" hidden>
+      <button class="btn ghost small" id="loader-cancel">Cancel</button>
+    </div>
   </div>
 </div>
 

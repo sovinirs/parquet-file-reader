@@ -13,7 +13,7 @@ leaf columns, and a list of rows tagged data / subtotal / grand.
 
 import datetime as _dt
 import decimal
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .engine import Dataset, Engine, categorise, to_jsonable
 from .filters import FilterError, build_where, quote_ident
@@ -158,12 +158,15 @@ def compute(
     max_columns: int = MAX_COLUMN_KEYS,
     jsonable: bool = True,
     grand_label: str = "Grand Total",
+    progress: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """Build the pivot; see the module docstring for the shape returned.
 
     With `jsonable` the cells are coerced for json.dumps. The Excel writer turns
     it off so dates stay native and land in the sheet as real dates.
+    `progress` is told what is happening at each step, for the loader.
     """
+    report = progress or (lambda message: None)
     types = dataset.column_types
     rows = list(rows or [])
     columns = list(columns or [])
@@ -199,9 +202,23 @@ def compute(
     # pool for the real query that follows -- and it buys two things: a row-group
     # count that is exact however large the pivot is, and the chance to not build
     # a pivot that will not fit.
+    if rows:
+        report("Counting the {} groups…".format(" › ".join(rows)))
     total_groups = count_row_groups(engine, dataset, rows, filters) if rows else 1
     value_sort = bool(rows and sort and sort.get("by") == "value")
-    windowed = bool(rows) and total_groups > overflow_at
+    # Window the scan when the pivot cannot all be held -- and also whenever it
+    # will be truncated anyway, provided nothing is lost by it: with one row
+    # field (or no subtotals) no subtotal can be cut in half, and without a
+    # value sort the first `max_rows` keys are exactly the ones that would be
+    # shown. Fetching only those halves the work for a wide pivot.
+    cheap_window = (total_groups > max_rows and not value_sort
+                    and (len(rows) == 1 or not subtotals))
+    windowed = bool(rows) and (total_groups > overflow_at or cheap_window)
+    groups_text = "{:,} row group{}".format(total_groups, "" if total_groups == 1 else "s") if rows else "one row"
+    report("Aggregating every matching row into {}{}{}…".format(
+        groups_text,
+        " across the {} columns".format(" › ".join(columns)) if columns else "",
+        " (fetching the first {:,})".format(max_rows) if windowed else ""))
 
     if windowed:
         grouped, meta = _run_query(engine, dataset, rows, columns, measures, filters,
@@ -226,9 +243,16 @@ def compute(
         # counted, and re-read the grand total from the whole filtered file.
         if len(rows) > 1 and subtotals:
             row_keys = _whole_outer_groups(row_keys)
+        report("Reading the grand total from every matching row…")
         cells.update(_grand_totals(engine, dataset, columns, measures, filters))
 
     ordered_cols = sorted(col_keys, key=_key_sort)
+    shown_groups = min(len(row_keys), max_rows)
+    report("Laying out {:,} row group{}{}{}…".format(
+        shown_groups, "" if shown_groups == 1 else "s",
+        " × {:,} column group{}".format(len(ordered_cols), "" if len(ordered_cols) == 1 else "s")
+        if columns else "",
+        " with subtotals" if subtotals and len(rows) > 1 else ""))
     leaves, header, lookups = _build_header(columns, ordered_cols, measures, row_totals)
     body, shown = _build_rows(rows, cells, row_keys, lookups, measures, subtotals,
                               column_totals, sort, max_rows, grand_label)

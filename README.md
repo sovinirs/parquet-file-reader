@@ -157,6 +157,19 @@ PivotTable does. Drag columns out of the left rail into the three wells — or u
 | **Columns** | Spreads the measures across the top. Optional — leave it empty for a plain grouped summary. |
 | **Values** | The measures: `Sum`, `Average`, `Min`, `Max`, `Count`, `Distinct count`, `Median`, `Std dev`, and `Count of rows`. Add the same column twice with different aggregations if you want. |
 
+Nothing is built while you arrange the fields. Add every row, column and
+measure you want, then press **▶ Run pivot** (or Ctrl/⌘+Enter) and the pivot is
+built once. After that, changing a field, an aggregation, a total option or a
+filter dims the table and flags **Run pivot** until you run it again, and
+**Export to Excel** waits for that run so the file always matches the screen.
+Sorting by a measure, and **Repeat labels**, apply straight away.
+
+While a pivot builds, a loader shows what is being built (rows, columns,
+measures and how many rows feed it) and each step with its time: counting the
+row groups, aggregating, reading the grand total when the pivot is truncated,
+laying the table out, and drawing it. **Cancel** stops waiting and keeps the
+table you had.
+
 Click any field chip for its menu: change the aggregation, sort the rows by that
 measure, move the field to another well, or drop it. **⇄ Swap** trades the Rows
 and Columns fields, and the four toggles control subtotals, the per-row **Total**
@@ -200,6 +213,12 @@ the Grand Total is re-read from the whole filtered file, so it still means what
 it says. Sorting by a measure is the one thing truncation costs you — there are
 too many groups to rank them all, so it ranks the ones shown, and the readout
 says so.
+
+A large pivot stays quick. With one row field (or subtotals off) and no sort by
+a measure, a pivot that will be truncated only fetches the rows it shows. In the
+browser, a pivot of more than 400 rows fixes its column widths once and then
+keeps only the rows in view in the page, swapping them as you scroll. On the 3M-row
+sample a 50,000-group pivot appears in about 0.7 seconds, down from about ten.
 
 ## Exporting
 
@@ -286,6 +305,8 @@ everything that queries a file.
 | `POST /api/stats` | Min/max/avg/median/distinct-approx for one column |
 | `GET /api/pivot/aggregations` | The aggregations the Values well offers, and the pivot's size limits |
 | `POST /api/pivot` | Build a pivot table (rows, columns, values, filters, sort, toggles) |
+| `POST /api/pivot/start` | Build a pivot in the background → job id. Same body as `POST /api/pivot` |
+| `GET /api/pivot/job/{job_id}` | That job's steps so far, with timings, and the pivot once it is done |
 | `POST /api/pivot/export` | Start a background pivot → Excel export job |
 | `POST /api/export` | Start a background row export job (xlsx/csv/parquet/json) |
 | `GET /api/export/{job_id}` | Poll export progress |

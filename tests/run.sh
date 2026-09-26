@@ -58,7 +58,9 @@ for line in lines:
     print("  " + line.replace('PASS |', 'ok  ').replace('FAIL |', 'FAIL'))
 bad = sum(1 for l in lines if l.startswith('FAIL'))
 print("\n  {} passed, {} failed".format(len(lines) - bad, bad))
-sys.exit(1 if bad else 0)
+if not lines:
+    print("  FAIL — no checks ran (the harness did not finish; see the page's console)")
+sys.exit(1 if bad or not lines else 0)
 PY
   UI_STATUS=$?
 
@@ -79,7 +81,9 @@ for line in lines:
     print("  " + line.replace('PASS |', 'ok  ').replace('FAIL |', 'FAIL'))
 bad = sum(1 for l in lines if l.startswith('FAIL'))
 print("\n  {} passed, {} failed".format(len(lines) - bad, bad))
-sys.exit(1 if bad else 0)
+if not lines:
+    print("  FAIL — no checks ran (the harness did not finish; see the page's console)")
+sys.exit(1 if bad or not lines else 0)
 JSPY
   JS_STATUS=$?
 fi

@@ -943,10 +943,50 @@ class TestPivotCompute(Base):
                 raise P._TooManyRowKeys()
             return real(*args, **kwargs)
 
+        # Two row fields with subtotals: not eligible for the up-front window,
+        # so the first pass is the unbounded one.
         with mock.patch.object(P, "_run_query", flaky):
-            out = self.pivot(rows=["region"], columns=[], max_rows=3)
+            out = self.pivot(rows=["region", "qty"], columns=[], max_rows=3)
         self.assertEqual(calls, [None, 3])
         self.assertTrue(out["truncated"])
+
+    def test_truncated_single_field_pivot_is_windowed_up_front(self):
+        real = P._run_query
+        calls = []
+
+        def spy(*args, **kwargs):
+            calls.append(kwargs.get("key_limit"))
+            return real(*args, **kwargs)
+
+        with mock.patch.object(P, "_run_query", spy):
+            one_field = self.pivot(rows=["id"], columns=["flag"], max_rows=10)
+            no_subtotals = self.pivot(rows=["region", "id"], columns=[], max_rows=10, subtotals=False)
+            by_value = self.pivot(rows=["id"], columns=[], max_rows=10, sort={"by": "value", "value_index": 0})
+            nested = self.pivot(rows=["region", "id"], columns=[], max_rows=10)
+        self.assertEqual(calls, [10, 10, None, None], "only safe shapes skip the full scan")
+        for out in (one_field, no_subtotals, by_value, nested):
+            self.assertEqual((out["row_groups"] <= 10, out["truncated"]), (True, True))
+            self.assertAlmostEqual(out["rows"][-1]["cells"][-1], scalar("SELECT sum(amount) FROM T"))
+        self.assertEqual([r["labels"][0] for r in one_field["rows"][:3]], ["0", "1", "2"])
+
+    def test_progress_is_reported(self):
+        steps = []
+        self.pivot(rows=["region", "flag"], columns=["qty"], progress=steps.append)
+        groups = scalar("SELECT count(*) FROM (SELECT DISTINCT region, flag FROM T)")
+        self.assertEqual(steps, [
+            "Counting the region › flag groups…",
+            "Aggregating every matching row into {} row groups across the qty columns…".format(groups),
+            "Laying out {} row groups × 9 column groups with subtotals…".format(groups)])
+        windowed = []
+        self.pivot(rows=["id"], columns=[], max_rows=10, progress=windowed.append)
+        self.assertEqual(windowed, [
+            "Counting the id groups…",
+            "Aggregating every matching row into 200 row groups (fetching the first 10)…",
+            "Reading the grand total from every matching row…",
+            "Laying out 10 row groups…"])
+        columns_only = []
+        self.pivot(rows=[], columns=["flag"], values=[{"agg": "count_rows"}], progress=columns_only.append)
+        self.assertEqual(columns_only[0], "Aggregating every matching row into one row across the flag columns…")
 
     def test_too_many_columns(self):
         with self.assertRaises(P.PivotError):
@@ -1229,7 +1269,7 @@ class TestMain(unittest.TestCase):
         page = M.preview(M.QueryRequest(dataset_id=did, columns=["id"], limit=5000, offset=-3, order_by="id"))
         self.assertEqual(len(page["rows"]), ROWS, "limit clamps to 1000, offset to 0")
         self.assertEqual(M.count(M.CountRequest(dataset_id=did)), {"count": ROWS, "total": ROWS})
-        vals = M.values(M.ValuesRequest(dataset_id=did, column="id", limit=99999))
+        vals = json.loads(M.values(M.ValuesRequest(dataset_id=did, column="id", limit=99999)).body)
         self.assertEqual(len(vals["values"]), ROWS)
         self.assertEqual(M.stats(M.StatsRequest(dataset_id=did, column="qty"))["hi"], 8)
         self.assertHttp(400, M.preview, M.QueryRequest(dataset_id=did, transforms={"amount": "year"}))
@@ -1274,6 +1314,43 @@ class TestMain(unittest.TestCase):
         self.assertLessEqual(len(M.open_jobs), 3)
         self.assertIn(ids[-1], M.open_jobs)
 
+    def run_pivot_job(self, request):
+        job = M.start_pivot(request)
+        deadline = time.time() + 30
+        while json.loads(M.pivot_job(job["id"]).body)["status"] == "running" and time.time() < deadline:
+            time.sleep(0.01)
+        return json.loads(M.pivot_job(job["id"]).body)
+
+    def test_pivot_job(self):
+        did = M.open_dataset(M.OpenRequest(path=FIXTURE))["id"]
+        done = self.run_pivot_job(M.PivotRequest(dataset_id=did, rows=["region"], columns=["flag"],
+                                                 values=[M.PivotValue(agg="count_rows")]))
+        self.assertEqual((done["status"], done["label"]), ("done", "region › flag"))
+        self.assertEqual(done["result"]["rows"][-1]["cells"][-1], ROWS)
+        self.assertEqual([s["message"][:12] for s in done["steps"]], ["Counting the", "Aggregating ", "Laying out 5"])
+        self.assertTrue(all(s["seconds"] is not None for s in done["steps"]))
+        failed = self.run_pivot_job(M.PivotRequest(dataset_id=did, rows=["nope"], values=[M.PivotValue(agg="count_rows")]))
+        self.assertEqual((failed["status"], failed["result"]), ("error", None))
+        self.assertIn("Unknown column", failed["error"])
+        self.assertHttp(404, M.start_pivot, M.PivotRequest(dataset_id="nope", rows=["region"]))
+        self.assertHttp(404, M.pivot_job, "nope")
+        with mock.patch.object(M, "MAX_PIVOT_JOBS", 2):
+            ids = [self.run_pivot_job(M.PivotRequest(dataset_id=did, rows=["flag"],
+                                                     values=[M.PivotValue(agg="count_rows")]))["id"] for _ in range(4)]
+        self.assertLessEqual(len(M.pivot_jobs), 3, "finished pivots, and their results, are not hoarded")
+        self.assertIn(ids[-1], M.pivot_jobs)
+
+    def test_step_job(self):
+        job = M.StepJob(id="j", label="x", result_key="dataset")
+        job.step("one")
+        job.step("two")
+        job.finish()
+        out = job.as_dict()
+        self.assertEqual([s["message"] for s in out["steps"]], ["one", "two"])
+        self.assertTrue(all(s["seconds"] is not None for s in out["steps"]))
+        self.assertIn("dataset", out)
+        self.assertNotIn("result", out)
+
     def test_union_route(self):
         a = os.path.join(TMP, "m_a.parquet")
         con.execute("COPY (SELECT * FROM read_parquet('{}') LIMIT 10) TO '{}'".format(FIXTURE, a))
@@ -1295,7 +1372,8 @@ class TestMain(unittest.TestCase):
         self.assertEqual({a["id"] for a in aggs["aggregations"]}, set(P.AGGREGATIONS))
         self.assertEqual(aggs["export_rows_per_file"], exporter_module.PIVOT_EXPORT_MAX_ROWS)
         did = M.open_dataset(M.OpenRequest(path=FIXTURE))["id"]
-        out = M.build_pivot(M.PivotRequest(dataset_id=did, rows=["flag"], values=[M.PivotValue(agg="count_rows")]))
+        out = json.loads(M.build_pivot(M.PivotRequest(dataset_id=did, rows=["flag"],
+                                                      values=[M.PivotValue(agg="count_rows")])).body)
         self.assertEqual(out["rows"][-1]["cells"], [ROWS])
         self.assertHttp(400, M.build_pivot, M.PivotRequest(dataset_id=did, rows=["flag"]))
         job = M.export_pivot(M.PivotExportRequest(dataset_id=did, rows=["flag"],

@@ -164,6 +164,20 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
        [state.pivot.rows, state.pivot.values.length], [['product', 'amount', 'status'], 1]);
     state.pivot.sort = { by: 'value', value_index: 0, descending: true };
     const payload = pivotPayload();
+    const signature = pivotSignature();
+    state.pivot.repeatLabels = !state.pivot.repeatLabels;
+    eq('repeat labels does not change what a run depends on', pivotSignature(), signature);
+    state.pivot.repeatLabels = false;
+    state.pivot.ranSignature = signature;
+    eq('a pivot matching its last run is not stale', pivotIsStale(), false);
+    state.pivot.subtotals = !state.pivot.subtotals;
+    eq('changing an option makes it stale', pivotIsStale(), true);
+    state.pivot.subtotals = !state.pivot.subtotals;
+    state.filters = { region: { column: 'region', op: 'in', values: ['north'] } };
+    eq('so does a filter', pivotIsStale(), true);
+    eq('describePivotRun', /Rows: product › amount › status · Columns: region · Values: Count of region · [\d,]+ rows after 1 filter/
+       .test(describePivotRun(pivotPayload())), true);
+    state.filters = {};
     eq('pivotPayload', [payload.rows, payload.columns, payload.values, payload.row_totals, payload.sort],
        [['product', 'amount', 'status'], ['region'], [{ column: 'region', agg: 'count' }], true,
         { by: 'value', value_index: 0, descending: true }]);
@@ -173,6 +187,48 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     eq('integralLeaves', integralLeaves({
       leaves: [{ is_count: true }, { is_count: false }, { is_count: false }],
       rows: [{ cells: [1.5, 2, 2.5] }, { cells: [3, null, 1] }] }), [true, true, false]);
+
+    // --- the pivot table: drawn whole when small, windowed when large ---
+    setMode('pivot');
+    const fakePivot = (n) => ({
+      row_fields: [{ name: 'region' }, { name: 'customer' }], column_fields: [],
+      header: [[{ label: 'Sum', span: 1, kind: 'data' }]],
+      leaves: [{ keys: [], value_index: 0, label: 'Sum', kind: 'data', is_count: false }],
+      rows: Array.from({ length: n }, (_, i) => ({
+        labels: [`r${Math.floor(i / 10)}`, `c${i}`], kind: 'data', level: 2, cells: [i + 0.5] }))
+        .concat([{ labels: ['Grand Total', ''], kind: 'grand', level: 0, cells: [n * n / 2] }]),
+      values: [], row_groups: n, total_row_groups: n, truncated: false });
+    const small = fakePivot(20);
+    renderPivotGrid(small);
+    eq('a small pivot is drawn whole', document.querySelectorAll('#pivot-body tr').length, 21);
+    eq('without the virtual layout', [document.getElementById('pivot-grid').classList.contains('virtual'),
+                                      !!document.querySelector('#pivot-grid colgroup'), pivotView], [false, false, null]);
+    const big = fakePivot(5000);
+    renderPivotGrid(big);
+    const wrapEl = document.getElementById('pivot-wrap');
+    const drawn = () => [...document.querySelectorAll('#pivot-body tr:not(.pv-spacer)')];
+    const spacers = () => [...document.querySelectorAll('#pivot-body tr.pv-spacer td')].map((td) => parseFloat(td.style.height));
+    eq('a large pivot draws only a window of rows', drawn().length < 200 && drawn().length > 20, true);
+    eq('with fixed column widths', [document.getElementById('pivot-grid').classList.contains('virtual'),
+                                    document.querySelectorAll('#pivot-grid colgroup col').length], [true, 3]);
+    eq('spacers plus drawn rows add up to every row',
+       Math.round((spacers().reduce((a, b) => a + b, 0) / pivotView.rowHeight) + drawn().length), 5001);
+    wrapEl.scrollTop = 2500 * pivotView.rowHeight;
+    paintPivotWindow(true);
+    const firstDrawn = pivotView.start;
+    eq('scrolling draws the rows now in view',
+       drawn()[0].children[1].textContent, `c${firstDrawn}`);
+    eq('the view sits inside the drawn window', firstDrawn < 2500 && pivotView.end > 2500, true);
+    eq('the repeated-label rule looks above the window, not just inside it',
+       drawn()[0].children[0].textContent, firstDrawn % 10 === 0 ? `r${firstDrawn / 10}` : '');
+    wrapEl.scrollTop = wrapEl.scrollHeight;
+    paintPivotWindow(true);
+    eq('the grand total is the last row', drawn().at(-1).classList.contains('grand'), true);
+    eq('pivotRowElement formats cells', pivotRowElement(big, 3, pivotView.context).children[2].textContent,
+       fmtPivotCell(3.5, false));
+    renderPivotGrid(small);
+    eq('going back to a small pivot drops the window', [pivotView, wrapEl.onscroll], [null, null]);
+    setMode('data');
 
     // --- the open loader ---
     renderLoader('Opening x.parquet', [
@@ -190,6 +246,15 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     renderLoader('Opening x.parquet', [{ message: 'Copying…' }], { percent: 40 });
     eq('upload progress bar', [document.getElementById('loader-track').hidden,
                                document.getElementById('loader-fill').style.width], [false, '40%']);
+    eq('no detail or cancel unless asked for', [document.getElementById('loader-detail').hidden,
+                                                document.getElementById('loader-foot').hidden], [true, true]);
+    let cancelled = false;
+    renderLoader('Building the pivot', [{ message: 'Counting…' }],
+                 { detail: 'Rows: region', onCancel: () => { cancelled = true; } });
+    eq('the loader shows what is being built', [document.getElementById('loader-detail').hidden,
+                                                document.getElementById('loader-detail').textContent], [false, 'Rows: region']);
+    document.getElementById('loader-cancel').click();
+    eq('and can be cancelled', [document.getElementById('loader-foot').hidden, cancelled], [false, true]);
     renderLoader('t', [{ message: 'a', seconds: 1 }], { done: true });
     eq('a finished list has no current step', document.querySelectorAll('#loader-steps .current').length, 0);
     const opened = await openWithLoader({ path }, 'sample');
