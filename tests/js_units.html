@@ -174,6 +174,32 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
       leaves: [{ is_count: true }, { is_count: false }, { is_count: false }],
       rows: [{ cells: [1.5, 2, 2.5] }, { cells: [3, null, 1] }] }), [true, true, false]);
 
+    // --- the open loader ---
+    renderLoader('Opening x.parquet', [
+      { message: 'Finding the parquet file…', seconds: 0.001 },
+      { message: 'Checking 9 columns…', seconds: 0.4 },
+      { message: 'Counting rows…', seconds: null }], { elapsed: 1.25 });
+    const steps = [...document.querySelectorAll('#loader-steps .loader-step')];
+    eq('loader lists every step', steps.length, 3);
+    eq('only the last step is current', steps.map((s) => s.classList.contains('current')), [false, false, true]);
+    eq('slow steps show their time, quick ones do not',
+       steps.map((s) => (s.querySelector('.loader-secs') || {}).textContent || ''), ['', '0.40s', '']);
+    eq('loader title and clock', [document.getElementById('loader-title').textContent,
+                                  document.getElementById('loader-time').textContent], ['Opening x.parquet', '1.3s']);
+    eq('no progress bar unless a percent is given', document.getElementById('loader-track').hidden, true);
+    renderLoader('Opening x.parquet', [{ message: 'Copying…' }], { percent: 40 });
+    eq('upload progress bar', [document.getElementById('loader-track').hidden,
+                               document.getElementById('loader-fill').style.width], [false, '40%']);
+    renderLoader('t', [{ message: 'a', seconds: 1 }], { done: true });
+    eq('a finished list has no current step', document.querySelectorAll('#loader-steps .current').length, 0);
+    const opened = await openWithLoader({ path }, 'sample');
+    eq('openWithLoader resolves with the dataset', opened.row_count, state.dataset.row_count);
+    eq('and hides the loader', document.getElementById('open-loader').hidden, true);
+    let failure = null;
+    try { await openWithLoader({ path: path + '.missing' }, 'nothing'); } catch (error) { failure = error.message; }
+    eq('openWithLoader rejects with the reason', /No such file/.test(failure || ''), true);
+    eq('the loader is hidden after a failure too', document.getElementById('open-loader').hidden, true);
+
     // --- the difference analysis is gone ---
     eq('no Difference tab', document.getElementById('tab-diff'), null);
     eq('no Difference view', document.getElementById('diff-view'), null);

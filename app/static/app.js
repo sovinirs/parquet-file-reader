@@ -290,12 +290,59 @@ const visibleColumns = () =>
 
 /* ─────────────────────────── opening a file ─────────────────────────── */
 
+/* -- the loader: what the backend is doing while a file opens -- */
+
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// Opening a small file takes milliseconds; only show the loader when it doesn't.
+const LOADER_DELAY_MS = 200;
+
+function renderLoader(title, steps, { elapsed = null, done = false, percent = null } = {}) {
+  $('loader-title').textContent = title;
+  $('loader-time').textContent = elapsed === null ? '' : `${elapsed.toFixed(1)}s`;
+  const list = $('loader-steps');
+  list.innerHTML = '';
+  steps.forEach((step, index) => {
+    const current = !done && index === steps.length - 1;
+    const item = el('li', `loader-step${current ? ' current' : ' done'}`);
+    item.append(el('span', 'loader-mark', current ? '' : '✓'), el('span', 'loader-text', step.message));
+    if (!current && step.seconds !== null && step.seconds !== undefined && step.seconds >= 0.05) {
+      item.appendChild(el('span', 'loader-secs mono', `${step.seconds.toFixed(2)}s`));
+    }
+    list.appendChild(item);
+  });
+  $('loader-track').hidden = percent === null;
+  if (percent !== null) $('loader-fill').style.width = `${percent}%`;
+}
+
+const showLoader = () => { $('open-loader').hidden = false; };
+const hideLoader = () => { $('open-loader').hidden = true; };
+
+/* Open a file (or a union) through a background job and narrate its steps.
+   Resolves with the dataset, or throws with the server's reason. */
+async function openWithLoader(body, label) {
+  let job = await api('/api/open/start', body);
+  const timer = setTimeout(showLoader, LOADER_DELAY_MS);
+  try {
+    while (job.status === 'running') {
+      renderLoader(`Opening ${label}`, job.steps, { elapsed: job.elapsed });
+      await pause(120);
+      job = await api(`/api/open/${job.id}`, undefined, 'GET');
+    }
+  } finally {
+    clearTimeout(timer);
+    hideLoader();
+  }
+  if (job.status === 'error') throw new Error(job.error || 'Could not open the file');
+  return job.dataset;
+}
+
 async function openPath(path) {
   if (!path || !path.trim()) return;
   setOpenError('');
   $('btn-open-path').disabled = true;
   try {
-    const dataset = await api('/api/open', { path: path.trim() });
+    const name = path.trim().replace(/[\\/]+$/, '').split(/[\\/]/).pop();
+    const dataset = await openWithLoader({ path: path.trim() }, name || path.trim());
     mountDataset(dataset);
   } catch (error) {
     setOpenError(error.message);
@@ -312,14 +359,40 @@ async function uploadFile(file) {
   setOpenError('');
   const form = new FormData();
   form.append('file', file);
-  toast(`Copying ${file.name} (${fmtBytes(file.size)})…`);
+  const title = `Opening ${file.name}`;
+  const copying = { message: `Copying ${fmtBytes(file.size)} to a temp folder…`, seconds: null };
+  const started = performance.now();
+  const elapsed = () => (performance.now() - started) / 1000;
+  renderLoader(title, [copying], { elapsed: 0, percent: 0 });
+  showLoader();
   try {
-    const response = await fetch('/api/upload', { method: 'POST', body: form });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.detail || 'Upload failed');
+    // XMLHttpRequest rather than fetch, because only it reports upload progress.
+    const data = await new Promise((resolve, reject) => {
+      const request = new XMLHttpRequest();
+      request.open('POST', '/api/upload');
+      request.upload.onprogress = (event) => {
+        if (!event.lengthComputable) return;
+        const percent = Math.round((100 * event.loaded) / event.total);
+        renderLoader(title, [copying], { elapsed: elapsed(), percent });
+        if (event.loaded === event.total) {
+          copying.seconds = elapsed();
+          renderLoader(title, [copying, { message: 'Reading the file…' }], { elapsed: elapsed() });
+        }
+      };
+      request.onload = () => {
+        let body = null;
+        try { body = JSON.parse(request.responseText); } catch (_) { /* not JSON */ }
+        if (request.status >= 200 && request.status < 300) resolve(body);
+        else reject(new Error((body && body.detail) || `Upload failed (${request.status})`));
+      };
+      request.onerror = () => reject(new Error('Upload failed — is the server still running?'));
+      request.send(form);
+    });
     mountDataset(data);
   } catch (error) {
     setOpenError(error.message);
+  } finally {
+    hideLoader();
   }
 }
 
@@ -376,7 +449,8 @@ async function openUnion() {
   setUnionError('');
   $('btn-union-open').disabled = true;
   try {
-    const dataset = await api('/api/union', { paths, source_column: $('union-source').checked });
+    const dataset = await openWithLoader({ paths, source_column: $('union-source').checked },
+                                         `${paths.length} files as one table`);
     mountDataset(dataset);
   } catch (error) {
     setUnionError(error.message);

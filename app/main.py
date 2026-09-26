@@ -8,6 +8,10 @@ import json
 import os
 import shutil
 import tempfile
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -40,6 +44,13 @@ class OpenRequest(BaseModel):
 class UnionRequest(BaseModel):
     paths: List[str]
     # Add a column naming the file each row came from.
+    source_column: bool = True
+
+
+class OpenStartRequest(BaseModel):
+    # One of: `path` (a file or folder), or `paths` for a union.
+    path: Optional[str] = None
+    paths: Optional[List[str]] = None
     source_column: bool = True
 
 
@@ -146,6 +157,62 @@ def _remember(path: str, name: str, rows: int) -> None:
         pass
 
 
+# ----------------------------------------------------------------- open jobs
+
+@dataclass
+class OpenJob:
+    """Opening a file in the background, so the UI can say what is happening."""
+
+    id: str
+    label: str
+    status: str = "running"          # running | done | error
+    steps: List[Dict[str, Any]] = field(default_factory=list)
+    dataset: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    started: float = field(default_factory=time.time)
+    finished: Optional[float] = None
+
+    def step(self, message: str) -> None:
+        now = time.time()
+        if self.steps:
+            self.steps[-1]["seconds"] = round(now - self.steps[-1]["at"], 3)
+        self.steps.append({"message": message, "at": now, "seconds": None})
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "status": self.status,
+            "steps": [{"message": s["message"], "seconds": s["seconds"]} for s in self.steps],
+            "dataset": self.dataset,
+            "error": self.error,
+            "elapsed": round((self.finished or time.time()) - self.started, 2),
+        }
+
+
+open_jobs: Dict[str, OpenJob] = {}
+MAX_OPEN_JOBS = 20
+
+
+def _run_open(job: OpenJob, request: OpenStartRequest) -> None:
+    try:
+        if request.paths:
+            dataset = _guard(engine.open_union, request.paths, request.source_column, job.step)
+        else:
+            dataset = _guard(engine.open, request.path or "", progress=job.step)
+            _remember(dataset.path, dataset.display_name, dataset.row_count)
+        job.step("Ready")
+        job.dataset = dataset.as_dict()
+        job.status = "done"
+    except HTTPException as exc:
+        job.error = exc.detail
+        job.status = "error"
+    finally:
+        job.finished = time.time()
+        if job.steps and job.steps[-1]["seconds"] is None:
+            job.steps[-1]["seconds"] = 0.0
+
+
 # --------------------------------------------------------------------- errors
 
 def _guard(fn, *args, **kwargs):
@@ -226,6 +293,30 @@ def open_dataset(request: OpenRequest) -> Dict[str, Any]:
 def union_datasets(request: UnionRequest) -> Dict[str, Any]:
     dataset = _guard(engine.open_union, request.paths, request.source_column)
     return dataset.as_dict()
+
+
+@app.post("/api/open/start")
+def start_open(request: OpenStartRequest) -> Dict[str, Any]:
+    """Open a file (or a union) in the background; poll /api/open/{id} for its steps."""
+    if not request.paths and not (request.path or "").strip():
+        raise HTTPException(status_code=400, detail="Give a path to open.")
+    label = (os.path.basename((request.path or "").rstrip(os.sep)) if not request.paths
+             else "{} files".format(len([p for p in request.paths if p.strip()])))
+    job = OpenJob(id=uuid.uuid4().hex[:12], label=label or "file")
+    open_jobs[job.id] = job
+    for stale in sorted(open_jobs.values(), key=lambda j: j.started)[:max(0, len(open_jobs) - MAX_OPEN_JOBS)]:
+        if stale.status != "running":
+            open_jobs.pop(stale.id, None)
+    threading.Thread(target=_run_open, args=(job, request), daemon=True).start()
+    return job.as_dict()
+
+
+@app.get("/api/open/{job_id}")
+def open_status(job_id: str) -> Dict[str, Any]:
+    job = open_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown open job")
+    return job.as_dict()
 
 
 @app.post("/api/upload")

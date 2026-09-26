@@ -78,6 +78,11 @@ format all work across it.
   file it came from, so you can filter, pivot or export by file.
 - A folder of parquet parts counts as one file in the list.
 
+While a file opens, a loader lists what the backend is doing — finding the
+files, reading the schema, checking for dates stored as text, counting rows — with
+how long each step took. It only appears if opening takes longer than a moment,
+and a dropped file shows its upload progress too.
+
 ## Filtering
 
 Click any column — in the left rail or via the ▾ on its grid header — to open its
@@ -110,7 +115,11 @@ column (and every integer column, for `20240131`-style values) are checked
 against common date layouts: `2024-01-31`, `31/01/2024`, `01/31/2024`,
 `31-01-2024`, `31.01.2024`, `20240131`, `31-Jan-2024`, `Jan 31, 2024` and their
 date-time variants. A column where every sampled value fits one gets the same
-**Extract** row, and reads `VARCHAR · dates` in the Columns rail.
+**Extract** row, and reads `VARCHAR · dates` in the Columns rail; every other
+text column is left alone. The check first compares each value's rough shape
+with each layout, so a column of names, codes or hashes is ruled out on its
+first value, and only the columns that survive are parsed by DuckDB. On a
+5.4 GB file with 40 text columns it adds about 0.2 seconds to opening.
 
 - The panel says how the dates are being read, e.g. *read as DD/MM/YYYY*. When
   every sampled date fits both day-first and month-first (no day above 12), you
@@ -266,6 +275,8 @@ everything that queries a file.
 | `GET /api/browse?path=` | List a directory's subfolders and `.parquet` files |
 | `POST /api/open` | Open a file or folder by absolute path → dataset info (id, columns, row count) |
 | `POST /api/union` | Open several files with the same columns as one table (`paths`, optional `source_column`) |
+| `POST /api/open/start` | Open a file (`path`) or a union (`paths`) in the background → job id. The UI uses this to show its loader |
+| `GET /api/open/{job_id}` | That job's steps so far, each with how long it took, and the dataset once it is done |
 | `POST /api/upload` | Upload a `.parquet` file (drag-and-drop / Browse) → dataset info |
 | `GET /api/dataset/{id}` | Re-fetch a previously opened dataset's info |
 | `DELETE /api/dataset/{id}` | Close a dataset and free its handle |

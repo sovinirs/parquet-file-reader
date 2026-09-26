@@ -175,6 +175,24 @@ class TestFilterHelpers(unittest.TestCase):
         with self.assertRaises(F.FilterError):
             F.parse_date_sql('"c"', "%d' OR 1=1 --")
 
+    def test_date_shapes_are_necessary_not_sufficient(self):
+        shapes = F.DATE_SHAPES
+        self.assertEqual(set(shapes), set(F.DATE_FORMATS))
+        # Every value DuckDB can read must pass its shape, or dates would be missed.
+        samples = {"iso": ["2024-01-31", "2024/1/31", "2024-01-31 10:11:12.5", "2024-01-31T10:11:12+05:30"],
+                   "%d/%m/%Y": ["31/01/2024", "3/4/2024"], "%d-%b-%Y": ["31-Jan-2024", "1-sep-2024"],
+                   "%b %d, %Y": ["Jan 31, 2024"], "%d %B %Y": ["31 January 2024"],
+                   "%d/%m/%Y %H:%M:%S": ["31/01/2024 10:11:12"], "%Y%m%d": ["20240131"],
+                   "%Y%m%d%H%M%S": ["20240131101112"], "%d.%m.%Y": ["31.01.2024"]}
+        for fmt, texts in samples.items():
+            for text in texts:
+                self.assertTrue(shapes[fmt].match(text), (fmt, text))
+                parsed = con.execute("SELECT {}".format(F.parse_date_sql("?", fmt)), [text]).fetchone()[0]
+                self.assertIsNotNone(parsed, (fmt, text))
+        # ...and ordinary text fails every shape at once.
+        for text in ("CODE-2024-01", "1.2.3", "cfcd208495d565ef66e7dff9f98764da", "north", "12345", "2024"):
+            self.assertFalse([f for f, rx in shapes.items() if rx.match(text)], text)
+
     def test_column_sql(self):
         self.assertEqual(F.column_sql("c", "BIGINT"), ('"c"', "BIGINT"))
         self.assertEqual(F.column_sql("d", "DATE", "year"), ('year("d")', "BIGINT"))
@@ -571,6 +589,41 @@ class TestDetectDates(unittest.TestCase):
         self.assertEqual(found["with_blanks"], ["%d/%m/%Y"])
         for name in ("one_bad", "all_null", "only_placeholders", "plain_int", "bad_ymd", "dbl"):
             self.assertEqual(found[name], [], name)
+
+    def test_only_date_columns_are_flagged(self):
+        found = self.detect(
+            "'CODE-2024-' || lpad((i % 12 + 1)::VARCHAR, 2, '0') AS code, "
+            "(i % 3)::VARCHAR || '.' || (i % 7)::VARCHAR || '.' || (i % 5)::VARCHAR AS version, "
+            "md5(i::VARCHAR) AS hash, lpad((i % 99999)::VARCHAR, 5, '0') AS zip, "
+            "'12/34/' || (2000 + i % 20)::VARCHAR AS impossible_day, "
+            "(i % 12 + 1)::VARCHAR || '/' || (i % 28 + 1)::VARCHAR AS no_year, "
+            "strftime(TIMESTAMP '2024-01-01' + INTERVAL (i) HOUR, '%Y-%m-%d %H:%M:%S') AS real_ts")
+        self.assertEqual({k: v for k, v in found.items() if v}, {"real_ts": ["iso"]})
+
+    def test_wide_files_stay_fast(self):
+        # 60 text columns, none of them dates: each should cost one regex test.
+        cols = ", ".join("md5((i * {k})::VARCHAR) AS t{k}".format(k=k) for k in range(60))
+        path = os.path.join(TMP, "wide-text.parquet")
+        con.execute("COPY (SELECT {} FROM range(5000) t(i)) TO '{}'".format(cols, path))
+        engine = Engine(threads=2)
+        started = time.time()
+        dataset = engine.open(path)
+        self.assertLess(time.time() - started, 1.5)
+        self.assertFalse([c.name for c in dataset.columns if c.date_formats])
+
+    def test_progress_is_reported(self):
+        steps = []
+        Engine(threads=2).open(FIXTURE, progress=steps.append)
+        self.assertEqual(steps, ["Finding the parquet file…", "Reading the schema…",
+                                 "Checking 8 columns for dates stored as text or numbers…", "Counting rows…"])
+        union = []
+        a = os.path.join(TMP, "p_a.parquet")
+        shutil.copy(FIXTURE, a)
+        Engine(threads=2).open_union([FIXTURE, a], progress=union.append)
+        self.assertEqual(union[:5], ["Finding 2 parquet files…", "Reading the schema of file 1 of 2…",
+                                     "Reading the schema of file 2 of 2…", "Comparing the files' columns…",
+                                     "Checking 8 columns for dates stored as text or numbers…"])
+        self.assertEqual(union[-1], "Counting rows…")
 
     def test_nothing_to_check_and_unreadable(self):
         cols = [Column("x", "DOUBLE", "numeric")]
@@ -1184,6 +1237,42 @@ class TestMain(unittest.TestCase):
         self.assertHttp(404, M.open_dataset, M.OpenRequest(path=FIXTURE + ".missing"))
         self.assertEqual(M.close_dataset(did), {"closed": True})
         self.assertHttp(404, M.dataset_info, did)
+
+    def run_open(self, **body):
+        job = M.start_open(M.OpenStartRequest(**body))
+        deadline = time.time() + 30
+        while M.open_status(job["id"])["status"] == "running" and time.time() < deadline:
+            time.sleep(0.01)
+        return M.open_status(job["id"])
+
+    def test_open_job(self):
+        done = self.run_open(path=FIXTURE)
+        self.assertEqual((done["status"], done["label"], done["dataset"]["row_count"]), ("done", "fixture.parquet", ROWS))
+        self.assertEqual([s["message"] for s in done["steps"]][-1], "Ready")
+        self.assertTrue(all(s["seconds"] is not None for s in done["steps"]), done["steps"])
+        self.assertEqual(M._load_recents()[0]["path"], FIXTURE)
+        self.assertEqual(M.dataset_info(done["dataset"]["id"])["name"], "fixture.parquet")
+        union = self.run_open(paths=[FIXTURE, FIXTURE + " "], source_column=True)
+        self.assertEqual(union["status"], "error")
+        self.assertIn("same as file 1", union["error"])
+        missing = self.run_open(path=FIXTURE + ".nope")
+        self.assertEqual(missing["status"], "error")
+        self.assertIn("No such file", missing["error"])
+        self.assertHttp(400, M.start_open, M.OpenStartRequest(path="  "))
+        self.assertHttp(404, M.open_status, "nope")
+
+    def test_open_job_union(self):
+        a = os.path.join(TMP, "oj_a.parquet")
+        shutil.copy(FIXTURE, a)
+        union = self.run_open(paths=[FIXTURE, a], source_column=False)
+        self.assertEqual((union["status"], union["label"], union["dataset"]["row_count"]), ("done", "2 files", ROWS * 2))
+        self.assertIsNone(union["dataset"]["source_column"])
+
+    def test_old_open_jobs_are_forgotten(self):
+        with mock.patch.object(M, "MAX_OPEN_JOBS", 2):
+            ids = [self.run_open(path=FIXTURE)["id"] for _ in range(4)]
+        self.assertLessEqual(len(M.open_jobs), 3)
+        self.assertIn(ids[-1], M.open_jobs)
 
     def test_union_route(self):
         a = os.path.join(TMP, "m_a.parquet")

@@ -315,6 +315,19 @@
   </footer>
 </div>
 
+<!-- ───────────────────────────── open loader ───────────────────────────── -->
+<div class="scrim loader-scrim" id="open-loader" hidden>
+  <div class="loader-card" role="status" aria-live="polite">
+    <div class="loader-head">
+      <span class="spinner small"></span>
+      <b id="loader-title">Opening…</b>
+      <span class="loader-time mono" id="loader-time"></span>
+    </div>
+    <ol class="loader-steps" id="loader-steps"></ol>
+    <div class="progress-track" id="loader-track" hidden><div class="progress-fill" id="loader-fill"></div></div>
+  </div>
+</div>
+
 <div class="toast-stack" id="toasts"></div>
 <input type="file" id="file-picker" accept=".parquet" hidden />
 

@@ -11,11 +11,11 @@ import os
 import threading
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import duckdb
 
-from .filters import DATE_FORMATS, FilterError, build_where, column_sql, parse_date_sql, quote_ident
+from .filters import DATE_FORMATS, DATE_SHAPES, FilterError, build_where, column_sql, parse_date_sql, quote_ident
 
 NUMERIC_PREFIXES = (
     "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT",
@@ -174,8 +174,16 @@ class Engine:
             raise FileNotFoundError("No such file: {}".format(expanded))
         return expanded, 1, os.path.getsize(expanded)
 
-    def open(self, path: str, is_temp: bool = False, display_name: Optional[str] = None) -> Dataset:
+    def open(self, path: str, is_temp: bool = False, display_name: Optional[str] = None,
+             progress: Optional[Callable[[str], None]] = None) -> Dataset:
+        """Open one file, or a folder of parts, as a dataset.
+
+        `progress` is told what is happening at each step, for the loader."""
+        report = progress or (lambda message: None)
+        report("Finding the parquet file…")
         source, file_count, size = self._resolve(path)
+        report("Reading the schema{}…".format(
+            " of {:,} files".format(file_count) if file_count > 1 else ""))
         cur = self.cursor()
         try:
             described = cur.execute(
@@ -185,10 +193,11 @@ class Engine:
             raise ValueError("Could not read parquet: {}".format(exc))
 
         columns = [Column(name=row[0], sql_type=row[1], category=categorise(row[1])) for row in described]
-        self._detect_dates(cur, source, columns)
         if not columns:
             raise ValueError("That parquet file has no columns.")
+        self._detect_dates(cur, source, columns, report)
 
+        report("Counting rows…")
         # Reads only the parquet footer metadata -- instant even for huge files.
         row_count = cur.execute(
             "SELECT count(*) FROM read_parquet(?, union_by_name=true)", [source]
@@ -207,17 +216,20 @@ class Engine:
         self.datasets[dataset.id] = dataset
         return dataset
 
-    def open_union(self, paths: Sequence[str], source_column: bool = True) -> Dataset:
+    def open_union(self, paths: Sequence[str], source_column: bool = True,
+                   progress: Optional[Callable[[str], None]] = None) -> Dataset:
         """Open several parquet sources as one table, stacked on top of each other.
 
         Each source can be a file or a folder of parts. They must share a schema:
         the same column names with the same types. Column order may differ, since
         columns are matched by name.
         """
+        report = progress or (lambda message: None)
         cleaned = [p for p in (str(p).strip() for p in paths or []) if p]
         if len(cleaned) < 2:
             raise ValueError("Choose at least two parquet files to union.")
 
+        report("Finding {} parquet files…".format(len(cleaned)))
         resolved = [self._resolve(p) for p in cleaned]
         sources = [source for source, _, _ in resolved]
         seen = {}
@@ -230,6 +242,7 @@ class Engine:
         cur = self.cursor()
         schemas = []
         for index, source in enumerate(sources):
+            report("Reading the schema of file {} of {}…".format(index + 1, len(sources)))
             try:
                 described = cur.execute(
                     "DESCRIBE SELECT * FROM read_parquet(?, union_by_name=true)", [source]
@@ -238,6 +251,7 @@ class Engine:
                 raise ValueError("Could not read file {} ({}): {}".format(index + 1, source, exc))
             schemas.append([(row[0], row[1]) for row in described])
 
+        report("Comparing the files' columns…")
         first = dict(schemas[0])
         problems = []
         for index, schema in enumerate(schemas[1:], start=2):
@@ -261,7 +275,7 @@ class Engine:
                              + " ".join(problems))
 
         columns = [Column(name=n, sql_type=t, category=categorise(t)) for n, t in schemas[0]]
-        self._detect_dates(cur, sources, columns)
+        self._detect_dates(cur, sources, columns, report)
         tag = None
         if source_column:
             taken = {c.name for c in columns}
@@ -272,6 +286,7 @@ class Engine:
                 tag = "source_file_{}".format(suffix)
             columns.append(Column(name=tag, sql_type="VARCHAR", category="text"))
 
+        report("Counting rows…")
         row_count = cur.execute(
             "SELECT count(*) FROM read_parquet(?, union_by_name=true)", [sources]
         ).fetchone()[0]
@@ -294,13 +309,16 @@ class Engine:
         return dataset
 
     @staticmethod
-    def _detect_dates(cur, source: Any, columns: List[Column]) -> None:
+    def _detect_dates(cur, source: Any, columns: List[Column],
+                      report: Optional[Callable[[str], None]] = None) -> None:
         """Spot text (and YYYYMMDD integer) columns that really hold dates.
 
-        One query over the first DATE_SAMPLE_ROWS rows counts, per column and
-        format, the non-blank values that fail to parse. A format that reads
-        every one of them is a match. Nothing is decided on a column with no
-        values in the sample.
+        Reads the first DATE_SAMPLE_ROWS rows once. For each candidate column a
+        format survives only if every non-blank sampled value has its rough
+        shape -- tested in Python, one value at a time, so a column of hashes
+        or codes is ruled out on its first value. DuckDB then parses the
+        survivors' distinct values, and a format that reads every one of them
+        is a match. Nothing is decided on a column with no values in the sample.
         """
         checks = []
         for column in columns:
@@ -315,30 +333,50 @@ class Engine:
         if not checks:
             return
 
-        parts, index = [], 0
-        for position, (column, formats) in enumerate(checks):
-            col = 's.c{}'.format(position)
-            present = "lower(trim(CAST({} AS VARCHAR))) NOT IN ('', {})".format(
-                col, ", ".join("'{}'".format(b) for b in DATE_BLANKS))
-            parts.append("count(*) FILTER (WHERE {})".format(present))
-            for fmt in formats:
-                parts.append("count(*) FILTER (WHERE {} AND {} IS NULL)".format(
-                    present, parse_date_sql(col, fmt)))
-        sample = ", ".join("{} AS c{}".format(quote_ident(column.name), position)
-                           for position, (column, _) in enumerate(checks))
-        sql = "SELECT {} FROM (SELECT {} FROM read_parquet(?, union_by_name=true) LIMIT {}) AS s".format(
-            ", ".join(parts), sample, DATE_SAMPLE_ROWS)
+        if report:
+            report("Checking {} column{} for dates stored as text or numbers…".format(
+                len(checks), "" if len(checks) == 1 else "s"))
+        sample_sql = "SELECT {} FROM read_parquet(?, union_by_name=true) LIMIT {}".format(
+            ", ".join(quote_ident(column.name) for column, _ in checks), DATE_SAMPLE_ROWS)
         try:
-            counts = cur.execute(sql, [source]).fetchone()
+            sample = cur.execute(sample_sql, [source]).fetchall()
         except duckdb.Error:
             return  # a best-effort hint, never a reason to refuse the file
 
-        for column, formats in checks:
-            present = counts[index]
-            failures = counts[index + 1:index + 1 + len(formats)]
-            index += 1 + len(formats)
-            if present:
-                column.date_formats = [fmt for fmt, bad in zip(formats, failures) if bad == 0]
+        for position, (column, formats) in enumerate(checks):
+            values = []
+            for record in sample:
+                value = record[position]
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text and text.lower() not in DATE_BLANKS:
+                    values.append(text)
+            if not values:
+                continue
+            # Ordered and de-duplicated: repeats say nothing new.
+            values = list(dict.fromkeys(values))
+            survivors = list(formats)
+            for text in values:
+                survivors = [fmt for fmt in survivors if DATE_SHAPES[fmt].match(text)]
+                if not survivors:
+                    break
+            if not survivors:
+                continue
+            # Parsed where the sample lives rather than handed over as a Python
+            # list: DuckDB's binding pays per element for a list parameter.
+            present = "lower(trim(CAST(s.v AS VARCHAR))) NOT IN ('', {})".format(
+                ", ".join("'{}'".format(b) for b in DATE_BLANKS))
+            probe = ("SELECT {} FROM (SELECT {} AS v FROM read_parquet(?, union_by_name=true) LIMIT {}) AS s "
+                     "WHERE s.v IS NOT NULL AND {}").format(
+                ", ".join("count(*) FILTER (WHERE {} IS NULL)".format(parse_date_sql("s.v", fmt))
+                          for fmt in survivors),
+                quote_ident(column.name), DATE_SAMPLE_ROWS, present)
+            try:
+                failures = cur.execute(probe, [source]).fetchone()
+            except duckdb.Error:
+                continue
+            column.date_formats = [fmt for fmt, bad in zip(survivors, failures) if bad == 0]
 
     def get(self, dataset_id: str) -> Dataset:
         dataset = self.datasets.get(dataset_id)

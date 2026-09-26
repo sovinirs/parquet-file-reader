@@ -6,6 +6,7 @@ parameters -- only identifiers are interpolated, and those are validated
 against the file's real schema before they get here.
 """
 
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Ops that read a list of discrete values
@@ -48,6 +49,29 @@ DATE_FORMATS = (
     "%d-%b-%Y", "%d %b %Y", "%d-%b-%y", "%b %d, %Y", "%b %d %Y", "%d %B %Y", "%B %d, %Y",
     "%d/%m/%y", "%m/%d/%y",
 )
+
+# A cheap, deliberately loose picture of what each format's text looks like.
+# It only rules formats *out* before DuckDB is asked -- so a hash or a product
+# code costs one regex test instead of twenty-odd parses -- and never decides
+# that something is a date: DuckDB still has the final word.
+_SHAPE_TOKENS = {"%Y": r"\d{4}", "%y": r"\d{2}", "%m": r"\d{1,2}", "%d": r"\d{1,2}",
+                 "%H": r"\d{1,2}", "%M": r"\d{1,2}", "%S": r"\d{1,2}(?:\.\d+)?",
+                 "%b": r"[A-Za-z]+\.?", "%B": r"[A-Za-z]+"}
+
+
+def _shape(date_format: str) -> "re.Pattern":
+    if date_format == "iso":
+        return re.compile(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[ T].*)?$")
+    pattern = ""
+    for piece in re.split(r"(%[A-Za-z])", date_format):
+        if piece in _SHAPE_TOKENS:
+            pattern += _SHAPE_TOKENS[piece]
+        elif piece:
+            pattern += r"\s+".join(re.escape(part) for part in piece.split(" "))
+    return re.compile("^" + pattern + "$")
+
+
+DATE_SHAPES = {fmt: _shape(fmt) for fmt in DATE_FORMATS}
 
 
 class FilterError(ValueError):
